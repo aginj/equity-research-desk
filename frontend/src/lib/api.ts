@@ -1,0 +1,263 @@
+import type {
+  AnalysisResult,
+  Book,
+  CoverageRequest,
+  Health,
+  Market,
+  MarketCatalog,
+  Me,
+  Preferences,
+  Recommendation,
+  RiskAppetite,
+  RunEvent,
+  RunStatus,
+  TickerIntel,
+  UniverseTicker,
+  WatchlistItem,
+} from "./types";
+
+/**
+ * Base URL for the research API. Empty (the production default) means same-origin: the
+ * browser calls `/api/v1/...` and the reverse proxy routes it to FastAPI. Local development
+ * points at the uvicorn port directly.
+ */
+export const API_URL = (
+  process.env.NEXT_PUBLIC_API_URL ?? (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8810" : "")
+).replace(/\/+$/, "");
+
+/**
+ * Bearer token minted by Auth.js after sign-in. Set by the workspace provider whenever the
+ * session changes; `null` means anonymous. Read-only endpoints work without it.
+ */
+let apiToken: string | null = null;
+
+export function setApiToken(token: string | null | undefined): void {
+  apiToken = token ?? null;
+}
+
+export function hasApiToken(): boolean {
+  return apiToken !== null;
+}
+
+const DEFAULT_TIMEOUT_MS = 20_000;
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: unknown;
+  readonly requestId: string | null;
+
+  constructor(status: number, message: string, detail: unknown, requestId: string | null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.requestId = requestId;
+  }
+}
+
+function describeDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    if ("message" in detail && typeof (detail as { message: unknown }).message === "string") {
+      return (detail as { message: string }).message;
+    }
+    if (Array.isArray(detail)) {
+      const first = detail[0] as { msg?: string; loc?: unknown[] } | undefined;
+      if (first?.msg) {
+        const where = Array.isArray(first.loc) ? first.loc.slice(1).join(".") : "";
+        return where ? `${where}: ${first.msg}` : first.msg;
+      }
+    }
+  }
+  return fallback;
+}
+
+async function toApiError(response: Response): Promise<ApiError> {
+  const requestId = response.headers.get("x-request-id");
+  let detail: unknown = null;
+  try {
+    const body = (await response.json()) as { detail?: unknown };
+    detail = body?.detail ?? body;
+  } catch {
+    detail = await response.text().catch(() => "");
+  }
+  const message = describeDetail(detail, `${response.status} ${response.statusText || "request failed"}`);
+  return new ApiError(response.status, message, detail, requestId);
+}
+
+async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), init?.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${API_URL}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+        ...(init?.headers ?? {}),
+      },
+      cache: "no-store",
+    });
+    if (!response.ok) throw await toApiError(response);
+    if (response.status === 204) return undefined as T;
+    return (await response.json()) as T;
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new ApiError(0, "The research API did not respond in time.", null, null);
+    }
+    throw new ApiError(0, "Unable to reach the research API.", err, null);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function qs(params: Record<string, string | number | null | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+  }
+  const encoded = search.toString();
+  return encoded ? `?${encoded}` : "";
+}
+
+export const api = {
+  health: () => request<Health>("/api/v1/health"),
+  markets: () => request<MarketCatalog>("/api/v1/markets"),
+
+  // --- admin: desk defaults and the analyzed universe -------------------------------------
+  universe: (marketId?: string) => request<UniverseTicker[]>(`/api/v1/universe${qs({ market_id: marketId })}`),
+  replaceUniverse: (tickers: string[], marketId?: string) =>
+    request<UniverseTicker[]>(`/api/v1/universe${qs({ market_id: marketId })}`, {
+      method: "PUT",
+      body: JSON.stringify({ tickers }),
+    }),
+  appetite: () => request<{ risk_appetite: RiskAppetite }>("/api/v1/settings/appetite"),
+  setAppetite: (risk_appetite: RiskAppetite) =>
+    request<{ risk_appetite: RiskAppetite }>("/api/v1/settings/appetite", {
+      method: "PUT",
+      body: JSON.stringify({ risk_appetite }),
+    }),
+  setMarket: (market_id: string) =>
+    request<{ market: Market }>("/api/v1/settings/market", {
+      method: "PUT",
+      body: JSON.stringify({ market_id }),
+    }),
+  coverageRequests: () => request<{ requests: CoverageRequest[] }>("/api/v1/admin/coverage-requests"),
+
+  // --- the book (public) ------------------------------------------------------------------
+  /** Latest completed run for a venue, re-ranked under `appetite` when given. */
+  book: async (marketId?: string, appetite?: RiskAppetite | null): Promise<Book | null> => {
+    try {
+      return await request<Book>(`/api/v1/book${qs({ market_id: marketId, appetite })}`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
+  },
+  latest: async (marketId?: string): Promise<AnalysisResult | null> => {
+    try {
+      return await request<AnalysisResult>(`/api/v1/runs/latest${qs({ market_id: marketId })}`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
+  },
+  runs: (limit = 12, marketId?: string) =>
+    request<AnalysisResult[]>(`/api/v1/runs${qs({ limit, market_id: marketId })}`),
+  run: (id: string) => request<AnalysisResult>(`/api/v1/runs/${encodeURIComponent(id)}`),
+  idea: (ticker: string, marketId?: string, appetite?: RiskAppetite | null) =>
+    request<{ run_id: string; appetite: RiskAppetite; recommendation: Recommendation; intel: TickerIntel | null }>(
+      `/api/v1/ideas/${encodeURIComponent(ticker)}${qs({ market_id: marketId, appetite })}`,
+    ),
+
+  // --- personal workspace (requires sign-in) ----------------------------------------------
+  me: () => request<Me>("/api/v1/me"),
+  setPreferences: (prefs: Partial<Preferences>) =>
+    request<Preferences>("/api/v1/me/preferences", { method: "PUT", body: JSON.stringify(prefs) }),
+  watchlist: (marketId?: string) => request<WatchlistItem[]>(`/api/v1/me/watchlist${qs({ market_id: marketId })}`),
+  watch: (ticker: string, marketId: string, note?: string) =>
+    request<WatchlistItem>(`/api/v1/me/watchlist/${encodeURIComponent(ticker)}`, {
+      method: "PUT",
+      body: JSON.stringify({ market_id: marketId, note }),
+    }),
+  unwatch: (ticker: string, marketId: string) =>
+    request<void>(`/api/v1/me/watchlist/${encodeURIComponent(ticker)}${qs({ market_id: marketId })}`, {
+      method: "DELETE",
+    }),
+
+  /**
+   * Start a desk run (admin). If one is already in progress the API answers 409 with its
+   * id; we attach to that run instead of surfacing an error.
+   */
+  startRun: async (body?: { tickers?: string[]; risk_appetite?: RiskAppetite; market_id?: string }) => {
+    try {
+      const started = await request<AnalysisResult>("/api/v1/runs", {
+        method: "POST",
+        body: JSON.stringify(body ?? {}),
+      });
+      return { run: started, attached: false as const };
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        const detail = err.detail as { run_id?: string } | null;
+        if (detail?.run_id) {
+          const existing = await request<AnalysisResult>(`/api/v1/runs/${detail.run_id}`);
+          return { run: existing, attached: true as const };
+        }
+      }
+      throw err;
+    }
+  },
+};
+
+const TERMINAL: ReadonlySet<RunStatus> = new Set<RunStatus>(["completed", "failed"]);
+
+export function isTerminal(status: RunStatus): boolean {
+  return TERMINAL.has(status);
+}
+
+/** Poll a run until it reaches a terminal state or the deadline passes. */
+export async function waitForRun(
+  runId: string,
+  opts: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<AnalysisResult> {
+  const interval = opts.intervalMs ?? 1_500;
+  const deadline = Date.now() + (opts.timeoutMs ?? 180_000);
+  let last = await api.run(runId);
+  while (!isTerminal(last.status)) {
+    if (opts.signal?.aborted) break;
+    if (Date.now() > deadline) {
+      throw new ApiError(0, `Run ${runId} is still ${last.status}; check the Runs page later.`, null, null);
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval));
+    last = await api.run(runId);
+  }
+  return last;
+}
+
+/**
+ * Subscribe to live stage events. The stream ends with a `done` event; on transport error we
+ * stop and let the caller fall back to polling, since the server-side bus replays history.
+ */
+export function subscribeRun(runId: string, onEvent: (event: RunEvent) => void, onDone: () => void) {
+  const source = new EventSource(`${API_URL}/api/v1/runs/${encodeURIComponent(runId)}/events`);
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    source.close();
+    onDone();
+  };
+  source.addEventListener("stage", (event) => {
+    try {
+      onEvent(JSON.parse((event as MessageEvent).data) as RunEvent);
+    } catch {
+      // Ignore malformed frames; polling remains the source of truth.
+    }
+  });
+  source.addEventListener("done", finish);
+  source.onerror = finish;
+  return finish;
+}

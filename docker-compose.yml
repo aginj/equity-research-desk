@@ -1,0 +1,60 @@
+name: equity-research-desk
+
+services:
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    ports:
+      - "8810:8000"
+    env_file:
+      - .env
+    environment:
+      SMP_ENVIRONMENT: ${SMP_ENVIRONMENT:-production}
+      SMP_LOG_JSON: "true"
+      SMP_CORS_ORIGINS: ${SMP_CORS_ORIGINS:-http://localhost:3810,http://127.0.0.1:3810}
+      # SQLite lives on the named volume; the image default already points here.
+      SMP_DATABASE_URL: sqlite:////app/data/desk.db
+      SMP_AUTH_JWT_SECRET: ${SMP_AUTH_JWT_SECRET:-}
+      SMP_ADMIN_EMAILS: ${SMP_ADMIN_EMAILS:-}
+    volumes:
+      - desk-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        # Baked into the browser bundle at build time. Point this at the URL the *browser*
+        # uses to reach the API (through your reverse proxy in real deployments).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8810}
+    environment:
+      # Optional login for local docker runs; see deploy/.env.production.example.
+      AUTH_SECRET: ${AUTH_SECRET:-dev-only-change-me-dev-only-change-me}
+      AUTH_URL: ${AUTH_URL:-http://localhost:3810}
+      AUTH_TRUST_HOST: "true"
+      SMP_AUTH_JWT_SECRET: ${SMP_AUTH_JWT_SECRET:-}
+      SMP_ADMIN_EMAILS: ${SMP_ADMIN_EMAILS:-}
+      API_INTERNAL_URL: http://api:8000
+    restart: unless-stopped
+    ports:
+      - "3810:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+volumes:
+  desk-data:

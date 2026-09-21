@@ -1,0 +1,161 @@
+name: equity-research-desk
+
+# Production stack for a single VPS: Caddy (TLS) -> Next.js + FastAPI -> Postgres.
+#
+#   cp deploy/.env.production.example deploy/.env.production   # then fill it in
+#   docker compose --env-file deploy/.env.production -f docker-compose.prod.yml up -d --build
+#
+# Only Caddy publishes ports. Everything else talks over the internal network.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      SMP_DOMAIN: ${SMP_DOMAIN:?set SMP_DOMAIN}
+      SMP_ACME_EMAIL: ${SMP_ACME_EMAIL:?set SMP_ACME_EMAIL}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+      - caddy-logs:/var/log/caddy
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks: [edge, internal]
+    logging: *default-logging
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-desk}
+      POSTGRES_USER: ${POSTGRES_USER:-desk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-desk} -d ${POSTGRES_DB:-desk}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks: [internal]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - deploy/.env.production
+    environment:
+      SMP_ENVIRONMENT: production
+      SMP_LOG_JSON: "true"
+      # Same origin as the web app, so CORS is effectively unused; keep it strict anyway.
+      SMP_CORS_ORIGINS: https://${SMP_DOMAIN}
+      SMP_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-desk}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-desk}
+      SMP_AUTH_JWT_SECRET: ${SMP_AUTH_JWT_SECRET:?set SMP_AUTH_JWT_SECRET}
+      SMP_ADMIN_EMAILS: ${SMP_ADMIN_EMAILS:-}
+      # Caddy is the only hop in front of uvicorn; trust its X-Forwarded-* headers.
+      FORWARDED_ALLOW_IPS: "*"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    networks: [internal]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        # Empty => the browser calls /api/v1 on the same origin and Caddy routes it.
+        NEXT_PUBLIC_API_URL: ""
+    restart: unless-stopped
+    env_file:
+      - deploy/.env.production
+    environment:
+      AUTH_URL: https://${SMP_DOMAIN}
+      AUTH_TRUST_HOST: "true"
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET}
+      SMP_AUTH_JWT_SECRET: ${SMP_AUTH_JWT_SECRET}
+      SMP_ADMIN_EMAILS: ${SMP_ADMIN_EMAILS:-}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-desk}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-desk}
+      # Server-side calls (Auth.js, route handlers) go straight to the API container.
+      API_INTERNAL_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [internal]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB:-desk}
+      PGUSER: ${POSTGRES_USER:-desk}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - pg-backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        while true; do
+          ts=$$(date -u +%Y%m%dT%H%M%SZ)
+          pg_dump --no-owner --format=custom | gzip > "/backups/desk-$${ts}.dump.gz"
+          find /backups -name 'desk-*.dump.gz' -mtime +"$${BACKUP_KEEP_DAYS}" -delete
+          echo "backup written: desk-$${ts}.dump.gz"
+          sleep 86400
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+    logging: *default-logging
+
+# `edge` carries public traffic to Caddy only; `internal` links the app tier. It is not marked
+# `internal: true` because the API must reach vendor APIs and LLM providers over the internet.
+networks:
+  edge:
+  internal:
+
+volumes:
+  pg-data:
+  pg-backups:
+  caddy-data:
+  caddy-config:
+  caddy-logs:

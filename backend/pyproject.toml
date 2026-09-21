@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "equity-research-desk"
+version = "1.1.0"
+description = "Agentic equity research desk — news, filings, and sourced recommendations."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Equity Research Desk" }]
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "sqlmodel>=0.0.22",
+  "pydantic>=2.9.0",
+  "pydantic-settings>=2.6.0",
+  "httpx>=0.27.2",
+  "python-dotenv>=1.0.1",
+  "openai>=1.55.0",
+  "orjson>=3.10.11",
+  "apscheduler>=3.10.4",
+  "alembic>=1.13.0",
+  "psycopg[binary]>=3.2.0",
+  "PyJWT>=2.9.0",
+  "limits>=3.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.7.0",
+]
+anthropic = [
+  "anthropic>=0.39.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+  "error::RuntimeWarning:app",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "T20", "SIM", "RUF100"]
+ignore = [
+  "SIM108",  # ternaries are not always clearer
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency markers are designed to live in parameter defaults.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Body"]
+
+[tool.ruff.lint.per-file-ignores]
+# Bundled fixture tables read better as one row per line.
+"app/data/*.py" = ["E501"]
+"tests/*.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

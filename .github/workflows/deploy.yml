@@ -1,0 +1,36 @@
+name: Deploy
+
+# Deploys to the VPS over SSH after CI passes on the default branch.
+# Required repository secrets:
+#   DEPLOY_HOST   e.g. 203.0.113.10
+#   DEPLOY_USER   e.g. deploy
+#   DEPLOY_SSH_KEY  private key whose public half is in ~/.ssh/authorized_keys on the VPS
+#   DEPLOY_PATH   e.g. /srv/equity-research-desk (a clone of this repo with deploy/.env.production present)
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          script: |
+            cd "${{ secrets.DEPLOY_PATH }}"
+            ./deploy/deploy.sh

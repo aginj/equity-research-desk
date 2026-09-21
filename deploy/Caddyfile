@@ -1,0 +1,53 @@
+# Reverse proxy for a single-domain Equity Research Desk deployment.
+#
+#   https://DOMAIN/api/v1/*  -> FastAPI (api:8000)
+#   https://DOMAIN/*         -> Next.js  (web:3000), including Auth.js under /api/auth/*
+#
+# Caddy obtains and renews Let's Encrypt certificates automatically. Set SMP_DOMAIN and
+# SMP_ACME_EMAIL in deploy/.env.production.
+
+{
+	email {$SMP_ACME_EMAIL}
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$SMP_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	@api path /api/v1/*
+	handle @api {
+		reverse_proxy api:8000 {
+			# Stream Server-Sent Events immediately instead of buffering.
+			flush_interval -1
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			transport http {
+				read_timeout 0
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000 {
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+		format json
+	}
+}
