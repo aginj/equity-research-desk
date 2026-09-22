@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import UTC, datetime
 from statistics import pstdev
 
 from app.domain import (
@@ -144,6 +145,10 @@ def risk_score(intel: TickerIntel) -> float:
     closes = intel.candle.closes if intel.candle else []
     if len(closes) > 5:
         vol = min(pstdev(closes) / (sum(closes) / len(closes)), 0.12) * 3
+    if intel.next_earnings is not None:
+        days = (intel.next_earnings.date() - datetime.now(UTC).date()).days
+        if 0 <= days <= 10:
+            event_risk += 0.12
     return clamp(0.22 + (beta - 1) * 0.18 + event_risk + vol)
 
 

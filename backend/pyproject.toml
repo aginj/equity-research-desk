@@ -24,6 +24,7 @@ dependencies = [
   "psycopg[binary]>=3.2.0",
   "PyJWT>=2.9.0",
   "limits>=3.13.0",
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

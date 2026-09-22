@@ -6,7 +6,6 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import {
   IconDesk,
-  IconHistory,
   IconMenu,
   IconShield,
   IconSliders,
@@ -14,6 +13,7 @@ import {
   IconX,
 } from "@/components/icons";
 import { MarketSwitcher } from "@/components/MarketSwitcher";
+import { NotificationBell } from "@/components/NotificationBell";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { UserMenu } from "@/components/UserMenu";
 import { useWorkspace } from "@/components/WorkspaceProvider";
@@ -32,8 +32,7 @@ const NAV: NavItem[] = [
   { href: "/", label: "Desk", hint: "Ranked book", icon: IconDesk },
   { href: "/research", label: "Research", hint: "News & filings tape", icon: IconWire },
   { href: "/workspace", label: "Workspace", hint: "Venue, appetite, watchlist", icon: IconSliders, requires: "user" },
-  { href: "/runs", label: "Runs", hint: "Audit history", icon: IconHistory },
-  { href: "/admin", label: "Admin", hint: "Universe & desk defaults", icon: IconShield, requires: "admin" },
+  { href: "/admin", label: "Admin", hint: "Universe, schedule & history", icon: IconShield, requires: "admin" },
 ];
 
 const TITLES: Record<string, string> = {
@@ -48,7 +47,7 @@ function isActive(pathname: string, href: string) {
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const { market, auth, isAdmin } = useWorkspace();
+  const { market, auth, isAdmin, authEnabled } = useWorkspace();
   const [menuOpen, setMenuOpen] = useState(false);
 
   const items = NAV.filter((item) => {
@@ -73,7 +72,12 @@ export function AppShell({ children }: { children: ReactNode }) {
       {/* Sidebar (desktop) */}
       <aside className="sticky top-0 hidden h-screen flex-col border-r border-border bg-bg-elevated/70 backdrop-blur-xl lg:flex">
         <Brand />
-        <Nav pathname={pathname} items={items} signedIn={auth === "authenticated"} />
+        <Nav
+          pathname={pathname}
+          items={items}
+          signedIn={auth === "authenticated"}
+          authRequired={authEnabled === true}
+        />
         <SidebarFooter />
       </aside>
 
@@ -96,7 +100,12 @@ export function AppShell({ children }: { children: ReactNode }) {
                 <IconX size={18} />
               </button>
             </div>
-            <Nav pathname={pathname} items={items} signedIn={auth === "authenticated"} />
+            <Nav
+              pathname={pathname}
+              items={items}
+              signedIn={auth === "authenticated"}
+              authRequired={authEnabled === true}
+            />
             <div className="space-y-3 border-t border-border p-4">
               <MarketSwitcher />
               <UserMenu />
@@ -132,6 +141,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               </div>
               <Clock timezone={market?.timezone ?? "UTC"} />
               <ThemeToggle />
+              <NotificationBell />
               <UserMenu compact />
             </div>
           </div>
@@ -174,13 +184,24 @@ function Brand() {
   );
 }
 
-function Nav({ pathname, items, signedIn }: { pathname: string; items: NavItem[]; signedIn: boolean }) {
+function Nav({
+  pathname,
+  items,
+  signedIn,
+  authRequired,
+}: {
+  pathname: string;
+  items: NavItem[];
+  signedIn: boolean;
+  /** When false/unknown, workspace is reachable without signing in (local open mode). */
+  authRequired: boolean;
+}) {
   return (
     <nav className="flex flex-1 flex-col gap-1 px-3 pt-2">
       {items.map((item) => {
         const active = isActive(pathname, item.href);
         const Icon = item.icon;
-        const locked = item.requires === "user" && !signedIn;
+        const locked = item.requires === "user" && !signedIn && authRequired;
         return (
           <Link
             key={item.href}

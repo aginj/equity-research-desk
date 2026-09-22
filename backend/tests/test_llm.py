@@ -1,6 +1,6 @@
 import pytest
 
-from app.agents.llm import sse_result_text
+from app.agents.llm import LLMClient, sse_result_text
 from app.config import Settings
 
 
@@ -46,3 +46,17 @@ data: {"runId":"run-1","status":"ERROR","text":""}
 """
     with pytest.raises(RuntimeError, match="ERROR"):
         sse_result_text(transcript.splitlines())
+
+
+def test_llm_call_cap_skips_completion():
+    import asyncio
+
+    from pydantic import BaseModel
+
+    class Tiny(BaseModel):
+        x: int
+
+    settings = _settings(OPENAI_API_KEY="sk-test").model_copy(update={"llm_max_calls_per_run": 1})
+    client = LLMClient(settings)
+    client.calls = 1
+    assert asyncio.run(client.complete_json("hello", Tiny)) is None

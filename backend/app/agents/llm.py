@@ -34,6 +34,12 @@ class LLMClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._openai_clients: dict[tuple[str, str | None], object] = {}
+        self.calls = 0
+        self.tokens = 0
+
+    def reset_usage(self) -> None:
+        self.calls = 0
+        self.tokens = 0
 
     @property
     def enabled(self) -> bool:
@@ -61,8 +67,13 @@ class LLMClient:
     ) -> T | None:
         if not self.enabled:
             return None
+        cap = self.settings.llm_max_calls_per_run
+        if cap and self.calls >= cap:
+            logger.info("LLM call cap reached for this run (%s)", cap)
+            return None
         try:
             raw = await self._complete(system, user, schema)
+            self.calls += 1
             if not raw:
                 return None
             payload = _extract_json(raw)
@@ -143,6 +154,9 @@ class LLMClient:
                 temperature=0.2,
                 messages=messages,
             )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.tokens += int(getattr(usage, "total_tokens", 0) or 0)
         return response.choices[0].message.content or ""
 
     async def _anthropic(self, system: str, user: str) -> str:
@@ -164,6 +178,10 @@ class LLMClient:
             )
             response.raise_for_status()
             data = response.json()
+            usage = data.get("usage") or {}
+            self.tokens += int(usage.get("input_tokens") or 0) + int(
+                usage.get("output_tokens") or 0
+            )
             parts = data.get("content") or []
             return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 

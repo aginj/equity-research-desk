@@ -34,6 +34,10 @@ class DataHub:
         self._cik_map: dict[str, str] | None = None
         self._cik_loaded_at: float = 0.0
         self._cik_lock = asyncio.Lock()
+        self.vendor_calls = 0
+
+    def reset_usage(self) -> None:
+        self.vendor_calls = 0
 
     # ------------------------------------------------------------------ public
 
@@ -65,13 +69,14 @@ class DataHub:
         if self.settings.force_demo_data:
             return self._from_demo(ticker, market)
 
-        profile, quote, fundamentals, news, filings, candle = await asyncio.gather(
+        profile, quote, fundamentals, news, filings, candle, earnings = await asyncio.gather(
             self._profile(client, ticker),
             self._quote(client, ticker, market),
             self._fundamentals(client, ticker),
             self._news(client, ticker),
             self._filings(client, ticker, market),
             self._candle(client, ticker),
+            self._earnings(client, ticker),
         )
         demo_row = self._from_demo(ticker, market)
         return TickerIntel(
@@ -82,6 +87,7 @@ class DataHub:
             news=news or demo_row.news,
             filings=filings or demo_row.filings,
             candle=candle or demo_row.candle,
+            next_earnings=earnings,
         )
 
     def _from_demo(self, ticker: str, market: MarketSpec) -> TickerIntel:
@@ -133,6 +139,7 @@ class DataHub:
         for attempt in range(retries + 1):
             try:
                 response = await client.get(url, params=params, headers=headers)
+                self.vendor_calls += 1
                 if response.status_code in _RETRY_STATUSES and attempt < retries:
                     retry_after = response.headers.get("Retry-After")
                     wait = float(retry_after) if retry_after and retry_after.isdigit() else delay
@@ -483,6 +490,38 @@ class DataHub:
         if not closes:
             return None
         return Candle(ticker=ticker, closes=closes[-32:], timestamps=stamps[-32:])
+
+    async def _earnings(self, client: httpx.AsyncClient, ticker: str) -> datetime | None:
+        if not self.settings.finnhub_api_key:
+            return None
+        today = datetime.now(UTC).date()
+        data = await self._get_json(
+            client,
+            "https://finnhub.io/api/v1/calendar/earnings",
+            label=f"finnhub earnings {ticker}",
+            params={
+                "from": today.isoformat(),
+                "to": (today + timedelta(days=90)).isoformat(),
+                "symbol": ticker,
+            },
+        )
+        if not isinstance(data, dict):
+            return None
+        rows = data.get("earningsCalendar") or []
+        dates: list[datetime] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol") or "").upper() != ticker.upper():
+                continue
+            raw = row.get("date")
+            if not raw:
+                continue
+            try:
+                dates.append(datetime.strptime(str(raw)[:10], "%Y-%m-%d").replace(tzinfo=UTC))
+            except ValueError:
+                continue
+        return min(dates) if dates else None
 
 
 def _parse_finnhub_quote(ticker: str, data: dict[str, Any], market: MarketSpec) -> Quote | None:

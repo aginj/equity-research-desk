@@ -2,17 +2,18 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { ActionPill } from "@/components/ActionPill";
 import { IconAlert, IconArrowLeft, IconExternal, IconFile, IconNews, IconStar, IconStarFilled } from "@/components/icons";
+import { RatingTimeline } from "@/components/RatingTimeline";
 import { ScoreBar } from "@/components/ScoreBar";
 import { Sparkline } from "@/components/Sparkline";
 import { useWorkspace } from "@/components/WorkspaceProvider";
 import { Alert, Badge, Button, Card, CardHeader, EmptyState, Skeleton, cx } from "@/components/ui";
 import { api } from "@/lib/api";
-import { compactCap, horizonLabel, money, pct, relativeTime, when } from "@/lib/format";
-import type { Recommendation, RiskAppetite, Source, TickerIntel } from "@/lib/types";
+import { compactCap, horizonLabel, ideaHref, money, pct, relativeTime, when } from "@/lib/format";
+import type { Book, RatingPoint, Recommendation, RiskAppetite, Source, TickerIntel } from "@/lib/types";
 
 const SOURCE_TONE: Record<Source["kind"], "accent" | "success" | "warning" | "neutral"> = {
   news: "accent",
@@ -28,6 +29,8 @@ export default function IdeaPage() {
   const [rec, setRec] = useState<Recommendation | null>(null);
   const [intel, setIntel] = useState<TickerIntel | null>(null);
   const [viewAppetite, setViewAppetite] = useState<RiskAppetite | null>(null);
+  const [history, setHistory] = useState<RatingPoint[]>([]);
+  const [book, setBook] = useState<Book | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -38,12 +41,19 @@ export default function IdeaPage() {
     setLoading(true);
     api
       .idea(ticker, marketId, appetite)
-      .then((payload) => {
+      .then(async (payload) => {
         if (cancelled) return;
         setRec(payload.recommendation);
         setIntel(payload.intel);
         setViewAppetite(payload.appetite);
         setError(null);
+        const [points, nextBook] = await Promise.all([
+          api.ideaHistory(ticker, marketId).catch(() => ({ points: [] as RatingPoint[] })),
+          api.book(marketId, appetite).catch(() => null),
+        ]);
+        if (cancelled) return;
+        setHistory(points.points);
+        setBook(nextBook);
       })
       .catch((err) => !cancelled && setError(err instanceof Error ? err.message : "Not found"))
       .finally(() => !cancelled && setLoading(false));
@@ -54,6 +64,13 @@ export default function IdeaPage() {
 
   const signedIn = auth === "authenticated";
   const starred = watched.has(ticker);
+  const peers = useMemo(
+    () =>
+      rec
+        ? (book?.run.recommendations ?? []).filter((row) => row.sector === rec.sector && row.ticker !== rec.ticker).slice(0, 8)
+        : [],
+    [book, rec],
+  );
 
   if (error) {
     return (
@@ -107,6 +124,9 @@ export default function IdeaPage() {
                 {rec.synthesis_mode === "llm" ? "LLM synthesis" : "Heuristic synthesis"}
               </Badge>
               {viewAppetite ? <Badge tone="neutral">Policy · {viewAppetite}</Badge> : null}
+              {intel?.next_earnings ? (
+                <Badge tone="warning">Earnings {when(intel.next_earnings)}</Badge>
+              ) : null}
             </div>
             <div className="mt-3 flex flex-wrap items-center gap-3">
               <h1 className="text-3xl font-semibold tracking-tight text-fg md:text-4xl">{rec.name}</h1>
@@ -307,6 +327,48 @@ export default function IdeaPage() {
           </Card>
         </section>
       ) : null}
+
+      <section className="fade-up grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+        <RatingTimeline points={history} />
+        <Card>
+          <CardHeader title="Peers in this book" description={rec.sector} />
+          {peers.length ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-left text-sm">
+                <thead>
+                  <tr className="border-b border-border text-[11px] uppercase tracking-wider text-muted">
+                    <th className="px-5 py-2 font-medium">Name</th>
+                    <th className="px-3 py-2 font-medium">Rating</th>
+                    <th className="px-3 py-2 font-medium">Conviction</th>
+                    <th className="px-3 py-2 font-medium">Composite</th>
+                    <th className="px-5 py-2 font-medium">Valuation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {peers.map((row) => (
+                    <tr key={row.ticker} className="border-b border-border last:border-0">
+                      <td className="px-5 py-2.5">
+                        <Link href={ideaHref(row.ticker)} className="mono text-xs font-semibold text-accent hover:underline">
+                          {row.ticker}
+                        </Link>
+                        <div className="truncate text-[11px] text-muted">{row.name}</div>
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <ActionPill action={row.action} />
+                      </td>
+                      <td className="mono tabular px-3 py-2.5 text-xs">{Math.round(row.conviction * 100)}</td>
+                      <td className="mono tabular px-3 py-2.5 text-xs">{Math.round(row.scores.composite * 100)}</td>
+                      <td className="mono tabular px-5 py-2.5 text-xs">{Math.round(row.scores.valuation_attractiveness * 100)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState title="No same-sector peers" description="This run has no other names in the sector." />
+          )}
+        </Card>
+      </section>
     </div>
   );
 }

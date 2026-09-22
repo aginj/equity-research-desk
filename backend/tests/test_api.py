@@ -150,6 +150,74 @@ def test_india_desk_run_uses_inr(client: TestClient):
         client.put("/api/v1/settings/market", json={"market_id": "us"})
 
 
+def test_schedule_get_lists_every_market(client: TestClient):
+    response = client.get("/api/v1/settings/schedule")
+    assert response.status_code == 200
+    body = response.json()
+    ids = {row["market_id"] for row in body["markets"]}
+    assert "us" in ids
+    assert "in-nse" in ids
+    nse = next(row for row in body["markets"] if row["market_id"] == "in-nse")
+    assert nse["timezone"] == "Asia/Kolkata"
+    assert nse["morning"] is None
+    assert body["clock"] is False
+
+
+def test_schedule_put_validates_and_persists(client: TestClient):
+    bad = client.put(
+        "/api/v1/settings/schedule",
+        json={"markets": [{"market_id": "in-nse", "morning": "9:30", "afternoon": None}]},
+    )
+    assert bad.status_code == 422
+
+    unknown = client.put(
+        "/api/v1/settings/schedule",
+        json={"markets": [{"market_id": "mars", "morning": "09:30", "afternoon": None}]},
+    )
+    assert unknown.status_code == 422
+
+    ok = client.put(
+        "/api/v1/settings/schedule",
+        json={
+            "markets": [
+                {"market_id": "in-nse", "morning": "09:30", "afternoon": "15:45"},
+                {"market_id": "us", "morning": None, "afternoon": None},
+            ]
+        },
+    )
+    assert ok.status_code == 200
+    nse = next(row for row in ok.json()["markets"] if row["market_id"] == "in-nse")
+    assert nse["morning"] == "09:30"
+    assert nse["afternoon"] == "15:45"
+    assert ok.json()["clock"] is True
+    assert ok.json()["next"]
+    assert ok.json()["next"][0]["market_id"] == "in-nse"
+
+    again = client.get("/api/v1/settings/schedule").json()
+    nse2 = next(row for row in again["markets"] if row["market_id"] == "in-nse")
+    assert nse2["morning"] == "09:30"
+
+    jobs = {job.id for job in client.app.state.desk_scheduler._scheduler.get_jobs()}
+    assert "desk-in-nse-morning" in jobs
+    assert "desk-in-nse-afternoon" in jobs
+
+    client.put("/api/v1/settings/schedule", json={"markets": []})
+    assert not client.app.state.desk_scheduler._scheduler.get_jobs()
+
+
+def test_presets_and_universe_validate(client: TestClient):
+    presets = client.get("/api/v1/markets/us/presets")
+    assert presets.status_code == 200
+    body = presets.json()
+    assert body["market_id"] == "us"
+    assert body["presets"]
+    assert body["presets"][0]["tickers"]
+    checked = client.post("/api/v1/admin/universe/validate", json={"tickers": ["AAPL", "MSFT"]})
+    assert checked.status_code == 200
+    assert checked.json()["verified"] is False
+    assert checked.json()["tickers"][0]["status"] == "not_verified"
+
+
 def test_api_key_guards_mutations(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SMP_API_KEY", "s3cret")
     get_settings.cache_clear()

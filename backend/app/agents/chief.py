@@ -90,6 +90,14 @@ def _action_from_scores(card: Scorecard) -> tuple[str, float]:
     return "watch", 0.42 + abs(c - 0.5)
 
 
+def _catalysts(intel: TickerIntel) -> list[str]:
+    items = [e.headline for e in intel.events[:3]] or [n.headline for n in intel.news[:2]]
+    if intel.next_earnings is not None:
+        stamp = intel.next_earnings.date().isoformat()
+        items = [f"Earnings {stamp}", *items]
+    return items[:5]
+
+
 def heuristic_recommendation(intel: TickerIntel) -> Recommendation:
     card = intel.scorecard or build_scorecard(intel)
     action, conviction = _action_from_scores(card)
@@ -128,7 +136,7 @@ def heuristic_recommendation(intel: TickerIntel) -> Recommendation:
             "Thesis breaks if the next reported print contradicts the current quality/growth "
             "assumptions, or if cited event risk materializes."
         ),
-        catalysts=[e.headline for e in intel.events[:3]] or [n.headline for n in intel.news[:2]],
+        catalysts=_catalysts(intel),
         risks=[
             r
             for r in [

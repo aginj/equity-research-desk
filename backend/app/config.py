@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     )
     scheduler_hours: int = Field(default=0, ge=0, le=24 * 30, alias="SMP_SCHEDULER_HOURS")
     run_history_limit: int = Field(default=200, ge=1, le=10_000, alias="SMP_RUN_HISTORY_LIMIT")
+    llm_max_calls_per_run: int = Field(
+        default=0, ge=0, le=10_000, alias="SMP_LLM_MAX_CALLS_PER_RUN"
+    )
 
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4.1-mini", alias="SMP_OPENAI_MODEL")

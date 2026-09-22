@@ -114,6 +114,9 @@ def test_mutations_require_admin(client: TestClient, auth_env: None):
     assert client.post("/api/v1/runs", json={}, headers=bearer(USER)).status_code == 403
     assert client.get("/api/v1/admin/coverage-requests", headers=bearer(USER)).status_code == 403
     assert client.get("/api/v1/admin/coverage-requests", headers=bearer(ADMIN)).status_code == 200
+    assert client.get("/api/v1/settings/schedule").status_code == 401
+    assert client.get("/api/v1/settings/schedule", headers=bearer(USER)).status_code == 403
+    assert client.get("/api/v1/settings/schedule", headers=bearer(ADMIN)).status_code == 200
 
 
 def test_api_key_still_works_as_machine_admin(
@@ -316,3 +319,156 @@ def test_run_trigger_has_its_own_tight_limit(client: TestClient, auth_env: None)
         active = client.get("/api/v1/health").json().get("active_run_id")
         if active:
             wait_for_run(client, active)
+
+
+# ------------------------------------------------------------------ local username/password
+
+
+@pytest.fixture
+def local_auth_clean(client: TestClient) -> Iterator[None]:
+    from app.store import reset_local_auth
+
+    reset_local_auth()
+    try:
+        yield
+    finally:
+        reset_local_auth()
+
+
+def test_first_local_account_is_admin_and_later_accounts_are_users(
+    client: TestClient, local_auth_clean: None
+):
+    first = client.post(
+        "/api/v1/auth/register", json={"username": "AdminDesk", "password": "correct-horse"}
+    )
+    assert first.status_code == 201
+    body = first.json()
+    assert body["user"]["role"] == "admin"
+    assert body["user"]["name"] == "admindesk"
+    assert body["token"]
+
+    health = client.get("/api/v1/health").json()
+    assert health["auth"] is True
+    assert health["local_users"] is True
+
+    second = client.post(
+        "/api/v1/auth/register", json={"username": "analyst", "password": "correct-horse"}
+    )
+    assert second.status_code == 201
+    assert second.json()["user"]["role"] == "user"
+
+    collide = client.post(
+        "/api/v1/auth/register", json={"username": "admindesk", "password": "correct-horse"}
+    )
+    assert collide.status_code == 409
+
+
+def test_local_login_and_admin_gate(client: TestClient, local_auth_clean: None):
+    client.post("/api/v1/auth/register", json={"username": "chief", "password": "correct-horse"})
+    client.post("/api/v1/auth/register", json={"username": "reader", "password": "correct-horse"})
+
+    bad = client.post(
+        "/api/v1/auth/login", json={"username": "chief", "password": "wrong-password"}
+    )
+    assert bad.status_code == 401
+
+    admin = client.post(
+        "/api/v1/auth/login", json={"username": "chief", "password": "correct-horse"}
+    )
+    user = client.post(
+        "/api/v1/auth/login", json={"username": "reader", "password": "correct-horse"}
+    )
+    admin_headers = bearer(admin.json()["token"])
+    user_headers = bearer(user.json()["token"])
+
+    me = client.get("/api/v1/me", headers=admin_headers).json()
+    assert me["user"]["role"] == "admin"
+    assert client.get("/api/v1/me/role", headers=user_headers).json() == {
+        "authenticated": True,
+        "role": "user",
+    }
+
+    assert client.post("/api/v1/runs", json={}).status_code == 401
+    assert client.post("/api/v1/runs", json={}, headers=user_headers).status_code == 403
+    started = client.post("/api/v1/runs", json={}, headers=admin_headers)
+    assert started.status_code in {202, 409}
+    active = client.get("/api/v1/health").json().get("active_run_id")
+    if active:
+        wait_for_run(client, active)
+
+
+def test_password_is_not_stored_in_plaintext(client: TestClient, local_auth_clean: None):
+    from app.store import get_local_account_by_username
+
+    client.post("/api/v1/auth/register", json={"username": "hashed", "password": "correct-horse"})
+    row = get_local_account_by_username("hashed")
+    assert row is not None
+    assert "correct-horse" not in row.password_hash
+    assert row.password_hash.startswith("pbkdf2_sha256$")
+
+
+def test_login_lockout_and_last_admin_guards(client: TestClient, local_auth_clean: None):
+    client.post("/api/v1/auth/register", json={"username": "chief", "password": "correct-horse"})
+    client.post("/api/v1/auth/register", json={"username": "reader", "password": "correct-horse"})
+    for _ in range(5):
+        bad = client.post(
+            "/api/v1/auth/login", json={"username": "reader", "password": "wrong-password"}
+        )
+        assert bad.status_code == 401
+    locked = client.post(
+        "/api/v1/auth/login", json={"username": "reader", "password": "wrong-password"}
+    )
+    assert locked.status_code == 429
+
+    admin = client.post(
+        "/api/v1/auth/login", json={"username": "chief", "password": "correct-horse"}
+    )
+    headers = bearer(admin.json()["token"])
+    users = client.get("/api/v1/admin/users", headers=headers).json()["users"]
+    chief = next(row for row in users if row["username"] == "chief")
+    reader = next(row for row in users if row["username"] == "reader")
+    deny = client.put(
+        f"/api/v1/admin/users/{chief['id']}/disabled",
+        json={"disabled": True},
+        headers=headers,
+    )
+    assert deny.status_code == 422
+    client.put(
+        f"/api/v1/admin/users/{reader['id']}/role",
+        json={"role": "admin"},
+        headers=headers,
+    )
+    ok = client.put(
+        f"/api/v1/admin/users/{reader['id']}/disabled",
+        json={"disabled": True},
+        headers=headers,
+    )
+    assert ok.status_code == 200
+    audit = client.get("/api/v1/admin/audit", headers=headers).json()["entries"]
+    assert any(row["action"] == "set_role" for row in audit)
+
+    changed = client.put(
+        "/api/v1/me/password",
+        json={"current_password": "correct-horse", "new_password": "new-correct"},
+        headers=headers,
+    )
+    assert changed.status_code == 200
+    again = client.post("/api/v1/auth/login", json={"username": "chief", "password": "new-correct"})
+    assert again.status_code == 200
+
+
+def test_notifications_endpoints(client: TestClient, local_auth_clean: None):
+    first = client.post(
+        "/api/v1/auth/register", json={"username": "chief", "password": "correct-horse"}
+    )
+    headers = bearer(first.json()["token"])
+    from app.notifications import notify_run_failed
+
+    created = notify_run_failed(market_id="us", run_id="run-test", error="scheduler boom")
+    assert created >= 1
+    payload = client.get("/api/v1/me/notifications", headers=headers).json()
+    assert payload["unread"] >= 1
+    assert any(row["kind"] == "run_failed" for row in payload["notifications"])
+    marked = client.post("/api/v1/me/notifications/read", json={"ids": None}, headers=headers)
+    assert marked.status_code == 200
+    assert client.get("/api/v1/me/notifications", headers=headers).json()["unread"] == 0

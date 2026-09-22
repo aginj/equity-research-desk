@@ -99,6 +99,7 @@ export type TickerIntel = {
   filing_bias: number;
   narrative: string;
   scorecard?: Scorecard | null;
+  next_earnings?: string | null;
 };
 
 export type DeskSummary = {
@@ -117,6 +118,7 @@ export type DeskSummary = {
   exchange?: string;
   currency?: string;
   caveats: string[];
+  usage?: { llm_calls: number; llm_tokens: number; vendor_calls: number };
 };
 
 export type AnalysisResult = {
@@ -127,6 +129,7 @@ export type AnalysisResult = {
   finished_at?: string | null;
   error?: string | null;
   market_id?: string;
+  triggered_by?: string | null;
   summary?: DeskSummary | null;
   recommendations: Recommendation[];
   intel: TickerIntel[];
@@ -182,6 +185,8 @@ export type Health = {
   live_market: boolean;
   force_demo: boolean;
   auth?: boolean;
+  local_auth?: boolean;
+  local_users?: boolean;
   risk_appetite: RiskAppetite;
   market?: Market;
   active_run_id?: string | null;
@@ -229,4 +234,109 @@ export type CoverageRequest = {
   market_id: string;
   ticker: string;
   requests: number;
+};
+
+export type MarketScheduleRow = {
+  market_id: string;
+  label: string;
+  timezone: string;
+  morning: string | null;
+  afternoon: string | null;
+  enabled?: boolean;
+  closed_dates?: string[];
+  last?: Record<string, { last_fired_at?: string; last_run_id?: string; last_status?: string }>;
+};
+
+export type ScheduledFire = {
+  market_id: string;
+  label: string;
+  slot: "morning" | "afternoon" | string;
+  at: string;
+  local_time: string;
+  timezone: string;
+};
+
+export type DeskSchedule = {
+  markets: MarketScheduleRow[];
+  next: ScheduledFire[];
+  interval_hours: number;
+  clock: boolean;
+};
+
+export type BookChangeItem = {
+  ticker: string;
+  name?: string;
+  action: Action;
+  conviction: number;
+  sector?: string;
+  previous_action?: Action;
+  previous_conviction?: number;
+};
+
+export type BookChanges = {
+  run_id: string | null;
+  previous_run_id: string | null;
+  previous_at: string | null;
+  appetite?: RiskAppetite | null;
+  new_accumulate: BookChangeItem[];
+  upgrades: BookChangeItem[];
+  downgrades: BookChangeItem[];
+  added: BookChangeItem[];
+  dropped: BookChangeItem[];
+};
+
+export type RatingPoint = {
+  run_id: string;
+  ticker: string;
+  action: Action | string;
+  conviction: number;
+  price: number;
+  currency: string;
+  sector?: string | null;
+  finished_at: string | null;
+};
+
+export type DeskNotification = {
+  id: string;
+  kind: string;
+  market_id?: string | null;
+  ticker?: string | null;
+  run_id?: string | null;
+  title: string;
+  body: string;
+  created_at: string | null;
+  read_at: string | null;
+};
+
+export type TrackRecord = {
+  market_id: string;
+  as_of: string;
+  caveat: string;
+  horizons: Record<string, { n: number; mean_return: number | null; hit_rate: number | null }>;
+};
+
+export type DeskUser = {
+  id: string;
+  username: string;
+  email?: string | null;
+  name?: string | null;
+  role: Role;
+  created_at?: string | null;
+  disabled: boolean;
+  locked: boolean;
+};
+
+export type AuditEntry = {
+  id: string;
+  at: string | null;
+  actor_id: string;
+  action: string;
+  target: string;
+  detail?: unknown;
+};
+
+export type UniversePreset = {
+  id: string;
+  label: string;
+  tickers: string[];
 };

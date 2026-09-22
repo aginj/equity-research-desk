@@ -141,6 +141,7 @@ class TickerIntel(BaseModel):
     filing_bias: float = 0.0
     narrative: str = ""
     scorecard: Scorecard | None = None
+    next_earnings: datetime | None = None
 
 
 class Recommendation(BaseModel):
@@ -171,6 +172,12 @@ class Recommendation(BaseModel):
         return cleaned
 
 
+class RunUsage(BaseModel):
+    llm_calls: int = 0
+    llm_tokens: int = 0
+    vendor_calls: int = 0
+
+
 class DeskSummary(BaseModel):
     regime: str
     headline: str
@@ -187,6 +194,7 @@ class DeskSummary(BaseModel):
     exchange: str = "NYSE & Nasdaq"
     currency: str = "USD"
     caveats: list[str] = Field(default_factory=list)
+    usage: RunUsage = Field(default_factory=RunUsage)
 
 
 class RunEvent(BaseModel):
@@ -205,6 +213,7 @@ class AnalysisResult(BaseModel):
     finished_at: datetime | None = None
     error: str | None = None
     market_id: str = "us"
+    triggered_by: str | None = None
     summary: DeskSummary | None = None
     recommendations: list[Recommendation] = Field(default_factory=list)
     intel: list[TickerIntel] = Field(default_factory=list)

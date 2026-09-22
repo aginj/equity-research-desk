@@ -13,10 +13,11 @@ from sqlmodel import Session, select
 
 from app import __version__
 from app.agents.orchestrator import DeskOrchestrator, RunInProgressError
-from app.auth import AuthUser, optional_user, require_admin, require_user
+from app.audit import list_audit, serialize_audit, write_audit
+from app.auth import AuthUser, mint_api_token, optional_user, require_admin, require_user
 from app.config import get_settings
 from app.data.demo import PROFILES
-from app.db import UniverseRow
+from app.db import UniverseRow, coerce_utc
 from app.domain import AnalysisResult, Book, RiskAppetite, UniverseTicker
 from app.markets import (
     MARKETS,
@@ -25,23 +26,54 @@ from app.markets import (
     get_market,
     market_payload,
     normalize_ticker,
+    presets_for,
 )
+from app.notifications import (
+    list_notifications,
+    mark_read,
+    serialize_notification,
+    unread_count,
+)
+from app.passwords import hash_password, verify_password
 from app.ratelimit import default_rate_limit, rate_limit
+from app.schedule import ScheduleError, parse_store
+from app.schedule import payload as schedule_payload
+from app.snapshots import (
+    diff_recommendations,
+    previous_completed_pair,
+    serialize_snapshot,
+    ticker_history,
+    track_record,
+)
 from app.store import (
     SETTING_ACTIVE_MARKET,
     add_to_watchlist,
+    clear_login_failures,
     coverage_requests,
+    create_local_account,
     current_appetite,
     current_market_id,
     ensure_market_universe,
     get_engine,
+    get_local_account,
+    get_local_account_by_username,
+    get_market_schedule,
     get_preferences,
+    get_schedule_state,
+    list_desk_users,
     list_watchlist,
+    local_account_count,
+    record_login_failure,
     remove_from_watchlist,
     set_appetite,
+    set_local_disabled,
+    set_local_password,
+    set_local_role,
+    set_market_schedule,
     set_preferences,
     set_setting,
     upsert_user,
+    utcnow,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +83,7 @@ _limit_runs = Depends(rate_limit(_settings.rate_limit_runs, "runs"))
 _limit_writes = Depends(rate_limit(_settings.rate_limit_writes, "writes"))
 
 # Exchange symbols: letters/digits, optional venue suffix (RELIANCE.NS, BRK-B, 0005.HK, ^NSEI).
+_USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9._-]{2,31}$")
 _TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-^=&]{0,19}$")
 _SSE_HEARTBEAT_SECONDS = 15.0
 HTTP_422 = 422  # starlette renamed its constant between versions; avoid the deprecation churn
@@ -75,6 +108,18 @@ class AppetiteUpdate(BaseModel):
     risk_appetite: RiskAppetite
 
 
+class MarketTimesIn(BaseModel):
+    market_id: str = Field(min_length=1, max_length=32)
+    morning: str | None = Field(default=None, max_length=8)
+    afternoon: str | None = Field(default=None, max_length=8)
+    enabled: bool = True
+    closed_dates: list[str] = Field(default_factory=list)
+
+
+class ScheduleUpdate(BaseModel):
+    markets: list[MarketTimesIn]
+
+
 class MarketUpdate(BaseModel):
     market_id: str = Field(min_length=1, max_length=32)
 
@@ -95,6 +140,42 @@ class UserOut(BaseModel):
     name: str | None
     image: str | None
     role: str
+
+
+class LocalAuthIn(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class NotificationsReadIn(BaseModel):
+    ids: list[str] | None = None
+
+
+class UserRoleIn(BaseModel):
+    role: str = Field(min_length=4, max_length=16)
+
+
+class UserDisabledIn(BaseModel):
+    disabled: bool
+
+
+class UserPasswordIn(BaseModel):
+    password: str = Field(min_length=8, max_length=128)
+
+
+class UniverseValidateIn(BaseModel):
+    tickers: list[str] = Field(min_length=1, max_length=500)
+
+
+class LocalAuthOut(BaseModel):
+    user: UserOut
+    token: str
+    exp: int
 
 
 class PreferencesOut(BaseModel):
@@ -215,6 +296,30 @@ def _user_out(user: AuthUser) -> UserOut:
     return UserOut(id=user.id, email=user.email, name=user.name, image=user.image, role=user.role)
 
 
+def _normalize_username(raw: str) -> str:
+    username = raw.strip().lower()
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(
+            HTTP_422,
+            "Username must be 3–32 characters, start with a letter, "
+            "and use only letters, digits, dots, underscores, or hyphens.",
+        )
+    return username
+
+
+def _session_for_local_account(account) -> LocalAuthOut:
+    user = AuthUser(
+        id=account.user_id,
+        email=f"{account.username}@local",
+        name=account.username,
+        image=None,
+        role="admin" if account.role == "admin" else "user",
+    )
+    token, exp = mint_api_token(user)
+    upsert_user(user.id, email=user.email, name=user.name, image=user.image, role=user.role)
+    return LocalAuthOut(user=_user_out(user), token=token, exp=exp)
+
+
 # ------------------------------------------------------------------- routes
 
 
@@ -231,6 +336,11 @@ def health(request: Request) -> dict:
         market_id = settings.default_market
         appetite = settings.risk_appetite
     orch = getattr(request.app.state, "orchestrator", None)
+    local_users = 0
+    try:
+        local_users = local_account_count()
+    except Exception:
+        logger.debug("Health check: could not count local accounts", exc_info=True)
     return {
         "status": "ok" if db_ok else "degraded",
         "app": settings.app_name,
@@ -240,7 +350,9 @@ def health(request: Request) -> dict:
         "llm": settings.has_llm,
         "live_market": settings.has_live_market,
         "force_demo": settings.force_demo_data,
-        "auth": settings.auth_enabled,
+        "auth": bool(settings.auth_jwt_secret) or local_users > 0,
+        "local_auth": True,
+        "local_users": local_users > 0,
         "risk_appetite": appetite,
         "market": market_payload(get_market(market_id)),
         "active_run_id": orch.active_run_id if orch else None,
@@ -254,6 +366,54 @@ def markets() -> dict:
     return payload
 
 
+# --- local username/password ----------------------------------------------------------------
+
+
+@router.post(
+    "/auth/register",
+    response_model=LocalAuthOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_limit_writes],
+)
+def register_local(payload: LocalAuthIn) -> LocalAuthOut:
+    """Create a local account. The first account on this desk becomes admin."""
+    username = _normalize_username(payload.username)
+    if get_local_account_by_username(username):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That username is already taken")
+    role = "admin" if local_account_count() == 0 else "user"
+    account = create_local_account(
+        user_id=f"local:{username}"[:64],
+        username=username,
+        password_hash=hash_password(payload.password),
+        role=role,
+        email=f"{username}@local",
+        name=username,
+    )
+    logger.info("Local account created", extra={"username": username, "role": role})
+    return _session_for_local_account(account)
+
+
+@router.post("/auth/login", response_model=LocalAuthOut, dependencies=[_limit_writes])
+def login_local(payload: LocalAuthIn) -> LocalAuthOut:
+    username = _normalize_username(payload.username)
+    account = get_local_account_by_username(username)
+    if account is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid username or password")
+    if account.disabled_at is not None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account is disabled")
+    locked_until = coerce_utc(account.locked_until)
+    if locked_until and locked_until > utcnow():
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Account locked after too many failed sign-ins. Try again in 15 minutes.",
+        )
+    if not verify_password(payload.password, account.password_hash):
+        record_login_failure(account.user_id)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid username or password")
+    clear_login_failures(account.user_id)
+    return _session_for_local_account(account)
+
+
 # --- desk defaults (admin) ------------------------------------------------------------------
 
 
@@ -263,11 +423,12 @@ def get_market_setting() -> dict:
 
 
 @router.put("/settings/market", dependencies=[Depends(require_admin)])
-def set_market_setting(payload: MarketUpdate) -> dict:
+def set_market_setting(payload: MarketUpdate, admin: AuthUser = Depends(require_admin)) -> dict:
     if payload.market_id not in MARKETS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown market")
     set_setting(SETTING_ACTIVE_MARKET, payload.market_id)
     ensure_market_universe(payload.market_id)
+    write_audit(admin.id, "set_default_market", payload.market_id)
     return {"market": market_payload(get_market(payload.market_id))}
 
 
@@ -277,9 +438,46 @@ def get_appetite() -> dict:
 
 
 @router.put("/settings/appetite", dependencies=[Depends(require_admin)])
-def set_appetite_setting(payload: AppetiteUpdate) -> dict:
+def set_appetite_setting(payload: AppetiteUpdate, admin: AuthUser = Depends(require_admin)) -> dict:
     set_appetite(payload.risk_appetite)
+    write_audit(admin.id, "set_appetite", payload.risk_appetite)
     return {"risk_appetite": payload.risk_appetite}
+
+
+@router.get("/settings/schedule", dependencies=[Depends(require_admin)])
+def get_schedule() -> dict:
+    return schedule_payload(
+        get_market_schedule(),
+        interval_hours=get_settings().scheduler_hours,
+        state=get_schedule_state(),
+    )
+
+
+@router.put("/settings/schedule", dependencies=[Depends(require_admin), _limit_writes])
+def update_schedule(
+    payload: ScheduleUpdate, request: Request, admin: AuthUser = Depends(require_admin)
+) -> dict:
+    raw = {
+        item.market_id: {
+            "morning": item.morning,
+            "afternoon": item.afternoon,
+            "enabled": item.enabled,
+            "closed_dates": item.closed_dates,
+        }
+        for item in payload.markets
+    }
+    try:
+        parse_store(raw)
+        stored = set_market_schedule(raw)
+    except ScheduleError as exc:
+        raise HTTPException(HTTP_422, str(exc)) from exc
+    scheduler = getattr(request.app.state, "desk_scheduler", None)
+    if scheduler is not None:
+        scheduler.reload()
+    write_audit(admin.id, "set_schedule", detail={"markets": len(payload.markets)})
+    return schedule_payload(
+        stored, interval_hours=get_settings().scheduler_hours, state=get_schedule_state()
+    )
 
 
 # --- universe -------------------------------------------------------------------------------
@@ -300,6 +498,7 @@ def universe(market_id: str | None = Query(default=None, max_length=32)) -> list
 def replace_universe(
     payload: UniverseUpdate,
     market_id: str | None = Query(default=None, max_length=32),
+    admin: AuthUser = Depends(require_admin),
 ) -> list[UniverseTicker]:
     market = _market_or_400(market_id)
     tickers = _clean_tickers(payload.tickers, get_settings().max_universe_size)
@@ -319,6 +518,7 @@ def replace_universe(
                 )
             )
         session.commit()
+    write_audit(admin.id, "replace_universe", market.id, {"count": len(tickers)})
     logger.info("Universe replaced", extra={"market": market.id, "count": len(tickers)})
     return _universe_rows(market)
 
@@ -344,9 +544,10 @@ async def start_run(
     tickers = (
         _clean_tickers(body.tickers, get_settings().max_universe_size) if body.tickers else None
     )
+    trigger = "api-key" if admin.id == "api-key" else f"manual:{admin.id}"
     try:
         result = await get_orchestrator(request).start(
-            tickers=tickers, appetite=appetite, market_id=market.id
+            tickers=tickers, appetite=appetite, market_id=market.id, trigger=trigger
         )
     except RunInProgressError as exc:
         raise HTTPException(
@@ -474,6 +675,69 @@ def idea(
     }
 
 
+@router.get("/ideas/{ticker}/history")
+def idea_history(
+    ticker: str,
+    market_id: str | None = Query(default=None, max_length=32),
+    limit: int = Query(default=40, ge=1, le=100),
+) -> dict:
+    market = _market_or_400(market_id)
+    symbol = normalize_ticker(ticker)
+    rows = ticker_history(market.id, symbol, limit=limit)
+    return {
+        "ticker": symbol,
+        "market_id": market.id,
+        "points": [serialize_snapshot(r) for r in rows],
+    }
+
+
+@router.get("/book/changes")
+def book_changes(
+    request: Request,
+    market_id: str | None = Query(default=None, max_length=32),
+    appetite: RiskAppetite | None = Query(default=None),
+) -> dict:
+    market = _market_or_400(market_id)
+    pair = previous_completed_pair(market.id)
+    empty = {
+        "run_id": None,
+        "previous_run_id": None,
+        "previous_at": None,
+        "appetite": appetite,
+        "new_accumulate": [],
+        "upgrades": [],
+        "downgrades": [],
+        "added": [],
+        "dropped": [],
+    }
+    if not pair:
+        latest = get_orchestrator(request).latest(market.id)
+        empty["run_id"] = latest.run_id if latest else None
+        return empty
+    newest_row, older_row = pair
+    orch = get_orchestrator(request)
+    current = orch.get(newest_row.id)
+    previous = orch.get(older_row.id)
+    if not current or not previous:
+        return empty
+    view_c, _ = (current, False) if appetite is None else orch.repolicy(current, appetite)
+    view_p, _ = (previous, False) if appetite is None else orch.repolicy(previous, appetite)
+    diff = diff_recommendations(view_c.recommendations, view_p.recommendations)
+    return {
+        **diff,
+        "run_id": current.run_id,
+        "previous_run_id": previous.run_id,
+        "previous_at": previous.finished_at.isoformat() if previous.finished_at else None,
+        "appetite": appetite or (current.summary.risk_appetite if current.summary else None),
+    }
+
+
+@router.get("/track-record")
+def desk_track_record(market_id: str | None = Query(default=None, max_length=32)) -> dict:
+    market = _market_or_400(market_id)
+    return track_record(market.id)
+
+
 @router.get("/recommendations")
 def recommendations(
     request: Request,
@@ -575,6 +839,39 @@ def unwatch(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.get("/me/notifications")
+def my_notifications(
+    unread: bool = Query(default=False),
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    rows = list_notifications(user.id, unread_only=unread)
+    return {
+        "unread": unread_count(user.id),
+        "notifications": [serialize_notification(row) for row in rows],
+    }
+
+
+@router.post("/me/notifications/read", dependencies=[_limit_writes])
+def read_notifications(
+    payload: NotificationsReadIn | None = None,
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    body = payload or NotificationsReadIn()
+    updated = mark_read(user.id, body.ids)
+    return {"updated": updated, "unread": unread_count(user.id)}
+
+
+@router.put("/me/password", dependencies=[_limit_writes])
+def change_own_password(payload: PasswordChangeIn, user: AuthUser = Depends(require_user)) -> dict:
+    account = get_local_account(user.id)
+    if account is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Password changes apply to local accounts")
+    if not verify_password(payload.current_password, account.password_hash):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Current password is incorrect")
+    set_local_password(user.id, hash_password(payload.new_password))
+    return {"ok": True}
+
+
 # --- admin ----------------------------------------------------------------------------------
 
 
@@ -582,6 +879,95 @@ def unwatch(
 def admin_coverage_requests() -> dict:
     """Watchlisted tickers outside the analyzed universe — demand signal for admins."""
     return {"requests": coverage_requests()}
+
+
+@router.get("/admin/users", dependencies=[Depends(require_admin)])
+def admin_users() -> dict:
+    return {"users": list_desk_users()}
+
+
+@router.put("/admin/users/{user_id}/role", dependencies=[Depends(require_admin), _limit_writes])
+def admin_set_role(
+    user_id: str, payload: UserRoleIn, admin: AuthUser = Depends(require_admin)
+) -> dict:
+    try:
+        row = set_local_role(user_id, payload.role)
+    except KeyError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found") from None
+    except ValueError as exc:
+        raise HTTPException(HTTP_422, str(exc)) from exc
+    write_audit(admin.id, "set_role", user_id, {"role": payload.role})
+    return {"id": row.user_id, "role": row.role}
+
+
+@router.put("/admin/users/{user_id}/disabled", dependencies=[Depends(require_admin), _limit_writes])
+def admin_set_disabled(
+    user_id: str, payload: UserDisabledIn, admin: AuthUser = Depends(require_admin)
+) -> dict:
+    try:
+        row = set_local_disabled(user_id, payload.disabled)
+    except KeyError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found") from None
+    except ValueError as exc:
+        raise HTTPException(HTTP_422, str(exc)) from exc
+    write_audit(admin.id, "set_disabled", user_id, {"disabled": payload.disabled})
+    return {"id": row.user_id, "disabled": row.disabled_at is not None}
+
+
+@router.put("/admin/users/{user_id}/password", dependencies=[Depends(require_admin), _limit_writes])
+def admin_set_password(
+    user_id: str, payload: UserPasswordIn, admin: AuthUser = Depends(require_admin)
+) -> dict:
+    try:
+        set_local_password(user_id, hash_password(payload.password))
+    except KeyError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found") from None
+    write_audit(admin.id, "reset_password", user_id)
+    return {"ok": True}
+
+
+@router.get("/admin/audit", dependencies=[Depends(require_admin)])
+def admin_audit(limit: int = Query(default=80, ge=1, le=200)) -> dict:
+    return {"entries": [serialize_audit(row) for row in list_audit(limit)]}
+
+
+@router.get("/markets/{market_id}/presets")
+def market_presets(market_id: str) -> dict:
+    if market_id not in MARKETS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown market")
+    return {"market_id": market_id, "presets": presets_for(market_id)}
+
+
+@router.post("/admin/universe/validate", dependencies=[Depends(require_admin)])
+async def validate_universe_symbols(
+    payload: UniverseValidateIn,
+    market_id: str | None = Query(default=None, max_length=32),
+) -> dict:
+    market = _market_or_400(market_id)
+    tickers = _clean_tickers(payload.tickers, get_settings().max_universe_size)
+    settings = get_settings()
+    if not settings.finnhub_api_key or settings.force_demo_data:
+        return {
+            "verified": False,
+            "tickers": [{"ticker": t, "status": "not_verified"} for t in tickers],
+        }
+    from app.ingest import DataHub
+
+    hub = DataHub(settings)
+    import httpx
+
+    results: list[dict] = []
+    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
+        for symbol in tickers:
+            quote = await hub._quote(client, symbol, market)
+            results.append(
+                {
+                    "ticker": symbol,
+                    "status": "ok" if quote else "unknown",
+                    "price": quote.price if quote else None,
+                }
+            )
+    return {"verified": True, "tickers": results}
 
 
 @router.get("/me/role")

@@ -230,3 +230,17 @@ export const IconExternal = (p: IconProps) => (
     <path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5" />
   </Icon>
 );
+
+export const IconBell = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M6 9a6 6 0 1 1 12 0c0 7 3 8 3 8H3s3-1 3-8" />
+    <path d="M10 21a2 2 0 0 0 4 0" />
+  </Icon>
+);
+
+export const IconUsers = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="9" cy="8" r="3" />
+    <path d="M3 19a6 6 0 0 1 12 0M17 11a3 3 0 1 0 0-6M21 19a5 5 0 0 0-4-4.9" />
+  </Icon>
+);

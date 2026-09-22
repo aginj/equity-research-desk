@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import secrets
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import event
@@ -14,11 +17,14 @@ from app.config import DATA_DIR, ROOT, get_settings
 from app.data.demo import PROFILES
 from app.db import (
     AnalysisRunRow,
+    LocalAccountRow,
+    RatingSnapshotRow,
     SettingRow,
     UniverseRow,
     UserPreferenceRow,
     UserRow,
     WatchlistRow,
+    coerce_utc,
     utcnow,
 )
 from app.domain import RiskAppetite
@@ -31,6 +37,10 @@ _engine: Engine | None = None
 _APPETITES: frozenset[str] = frozenset({"conservative", "balanced", "aggressive"})
 SETTING_ACTIVE_MARKET = "active_market"
 SETTING_RISK_APPETITE = "risk_appetite"
+# HMAC key for local username/password sessions when SMP_AUTH_JWT_SECRET is unset.
+SETTING_JWT_SECRET = "auth_jwt_secret"
+SETTING_MARKET_SCHEDULE = "market_schedule"
+SETTING_SCHEDULE_STATE = "schedule_state"
 
 
 def _resolve_sqlite_url(url: str) -> str:
@@ -84,6 +94,9 @@ def reset_engine() -> None:
 
 def init_db() -> None:
     run_migrations()
+    from app.snapshots import backfill_snapshots
+
+    backfill_snapshots()
     seed_universe()
 
 
@@ -137,6 +150,55 @@ def current_appetite() -> RiskAppetite:
 
 def set_appetite(value: RiskAppetite) -> None:
     set_setting(SETTING_RISK_APPETITE, value)
+
+
+def get_market_schedule() -> dict[str, dict]:
+    from app.schedule import ScheduleError, empty_store, parse_store
+
+    raw = get_setting(SETTING_MARKET_SCHEDULE, "")
+    if not raw:
+        return empty_store()
+    try:
+        payload = json.loads(raw)
+        return parse_store(payload)
+    except (json.JSONDecodeError, ScheduleError):
+        return empty_store()
+
+
+def set_market_schedule(store: dict[str, dict]) -> dict[str, dict]:
+    from app.schedule import parse_store
+
+    normalized = parse_store(store)
+    set_setting(SETTING_MARKET_SCHEDULE, json.dumps(normalized, separators=(",", ":")))
+    return normalized
+
+
+def get_schedule_state() -> dict:
+    raw = get_setting(SETTING_SCHEDULE_STATE, "")
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def record_schedule_fire(
+    market_id: str,
+    slot: str,
+    *,
+    run_id: str | None,
+    status: str,
+) -> None:
+    state = get_schedule_state()
+    venue = state.setdefault(market_id, {})
+    venue[slot] = {
+        "last_fired_at": utcnow().isoformat(),
+        "last_run_id": run_id,
+        "last_status": status,
+    }
+    set_setting(SETTING_SCHEDULE_STATE, json.dumps(state, separators=(",", ":")))
 
 
 def ensure_market_universe(market_id: str) -> None:
@@ -196,6 +258,10 @@ def prune_run_history(keep: int) -> int:
         ).all()
         stale = rows[keep:]
         for row in stale:
+            for snap in session.exec(
+                select(RatingSnapshotRow).where(RatingSnapshotRow.run_id == row.id)
+            ).all():
+                session.delete(snap)
             session.delete(row)
         if stale:
             session.commit()
@@ -310,6 +376,94 @@ def remove_from_watchlist(user_id: str, market_id: str, ticker: str) -> bool:
         return True
 
 
+def local_account_count() -> int:
+    with Session(get_engine()) as session:
+        return len(list(session.exec(select(LocalAccountRow)).all()))
+
+
+def get_local_account(user_id: str) -> LocalAccountRow | None:
+    with Session(get_engine()) as session:
+        return session.get(LocalAccountRow, user_id)
+
+
+def get_local_account_by_username(username: str) -> LocalAccountRow | None:
+    key = username.strip().lower()
+    with Session(get_engine()) as session:
+        return session.exec(select(LocalAccountRow).where(LocalAccountRow.username == key)).first()
+
+
+def create_local_account(
+    *,
+    user_id: str,
+    username: str,
+    password_hash: str,
+    role: str,
+    email: str | None,
+    name: str | None,
+) -> LocalAccountRow:
+    """Create the app_user mirror and the local credential row together."""
+    upsert_user(user_id, email=email, name=name, image=None, role=role)
+    with Session(get_engine()) as session:
+        row = LocalAccountRow(
+            user_id=user_id,
+            username=username.strip().lower(),
+            password_hash=password_hash,
+            role=role,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def persisted_jwt_secret() -> str | None:
+    value = get_setting(SETTING_JWT_SECRET, "")
+    return value or None
+
+
+def ensure_jwt_secret() -> str:
+    """Return the HMAC key used to mint/verify desk API tokens.
+
+    Prefers ``SMP_AUTH_JWT_SECRET``. Otherwise reuses (or creates) a secret stored in
+    the local database so username/password login works without editing ``.env``.
+    """
+    env_secret = get_settings().auth_jwt_secret
+    if env_secret:
+        return env_secret
+    existing = persisted_jwt_secret()
+    if existing:
+        return existing
+    generated = secrets.token_urlsafe(48)
+    set_setting(SETTING_JWT_SECRET, generated)
+    return generated
+
+
+def reset_local_auth() -> None:
+    """Remove local accounts and the persisted JWT secret. Used by tests."""
+    with Session(get_engine()) as session:
+        for row in list(session.exec(select(LocalAccountRow)).all()):
+            session.delete(row)
+        secret = session.get(SettingRow, SETTING_JWT_SECRET)
+        if secret:
+            session.delete(secret)
+        local_users = list(
+            session.exec(select(UserRow).where(col(UserRow.id).like("local:%"))).all()
+        )
+        ids = [row.id for row in local_users]
+        if ids:
+            for pref in session.exec(
+                select(UserPreferenceRow).where(col(UserPreferenceRow.user_id).in_(ids))
+            ).all():
+                session.delete(pref)
+            for watch in session.exec(
+                select(WatchlistRow).where(col(WatchlistRow.user_id).in_(ids))
+            ).all():
+                session.delete(watch)
+            for row in local_users:
+                session.delete(row)
+        session.commit()
+
+
 def coverage_requests() -> list[dict[str, object]]:
     """Watchlisted tickers that are not in the analyzed universe, with demand counts."""
     with Session(get_engine()) as session:
@@ -327,3 +481,115 @@ def coverage_requests() -> list[dict[str, object]]:
         {"market_id": market_id, "ticker": ticker, "requests": n}
         for (market_id, ticker), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
+
+
+LOCKOUT_AFTER = 5
+LOCKOUT_MINUTES = 15
+
+
+def list_desk_users() -> list[dict]:
+    with Session(get_engine()) as session:
+        accounts = list(session.exec(select(LocalAccountRow)).all())
+        users = {row.id: row for row in session.exec(select(UserRow)).all()}
+    out = []
+    for account in accounts:
+        user = users.get(account.user_id)
+        locked_until = coerce_utc(account.locked_until)
+        out.append(
+            {
+                "id": account.user_id,
+                "username": account.username,
+                "email": user.email if user else None,
+                "name": user.name if user else account.username,
+                "role": account.role,
+                "created_at": account.created_at.isoformat() if account.created_at else None,
+                "disabled": account.disabled_at is not None,
+                "locked": bool(locked_until and locked_until > utcnow()),
+            }
+        )
+    out.sort(key=lambda item: item["username"])
+    return out
+
+
+def local_admin_count() -> int:
+    with Session(get_engine()) as session:
+        return len(
+            [
+                row
+                for row in session.exec(
+                    select(LocalAccountRow).where(LocalAccountRow.role == "admin")
+                ).all()
+                if row.disabled_at is None
+            ]
+        )
+
+
+def set_local_role(user_id: str, role: str) -> LocalAccountRow:
+    if role not in {"user", "admin"}:
+        raise ValueError("Role must be user or admin")
+    with Session(get_engine()) as session:
+        row = session.get(LocalAccountRow, user_id)
+        if row is None:
+            raise KeyError(user_id)
+        if row.role == "admin" and role != "admin" and local_admin_count() <= 1:
+            raise ValueError("Cannot demote the last admin")
+        row.role = role
+        session.add(row)
+        user = session.get(UserRow, user_id)
+        if user:
+            user.role = role
+            session.add(user)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def set_local_disabled(user_id: str, disabled: bool) -> LocalAccountRow:
+    with Session(get_engine()) as session:
+        row = session.get(LocalAccountRow, user_id)
+        if row is None:
+            raise KeyError(user_id)
+        if disabled and row.role == "admin" and local_admin_count() <= 1:
+            raise ValueError("Cannot disable the last admin")
+        row.disabled_at = utcnow() if disabled else None
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def set_local_password(user_id: str, password_hash: str) -> None:
+    with Session(get_engine()) as session:
+        row = session.get(LocalAccountRow, user_id)
+        if row is None:
+            raise KeyError(user_id)
+        row.password_hash = password_hash
+        row.failed_logins = 0
+        row.locked_until = None
+        session.add(row)
+        session.commit()
+
+
+def record_login_failure(user_id: str) -> LocalAccountRow | None:
+    with Session(get_engine()) as session:
+        row = session.get(LocalAccountRow, user_id)
+        if row is None:
+            return None
+        row.failed_logins = int(row.failed_logins or 0) + 1
+        if row.failed_logins >= LOCKOUT_AFTER:
+            row.locked_until = utcnow() + timedelta(minutes=LOCKOUT_MINUTES)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def clear_login_failures(user_id: str) -> None:
+    with Session(get_engine()) as session:
+        row = session.get(LocalAccountRow, user_id)
+        if row is None:
+            return
+        row.failed_logins = 0
+        row.locked_until = None
+        session.add(row)
+        session.commit()

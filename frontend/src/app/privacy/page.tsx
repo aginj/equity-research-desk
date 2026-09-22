@@ -9,19 +9,19 @@ export default function PrivacyPage() {
     <LegalPage eyebrow="Privacy notice" title="What we store, and why" updated="September 2026">
       <h2>Reading the desk</h2>
       <p>
-        You can read the ranked book, research tape, idea pages, and run history without an account. For anonymous
-        visitors we keep standard server access logs (IP address, user agent, requested URL, timestamp) for security
-        and rate limiting, rotated automatically. Your chosen venue and appetite are stored only in your browser&apos;s
-        local storage.
+        You can read the ranked book, research tape, and idea pages without an account. Run history and desk schedules
+        are admin-only in the UI. For anonymous visitors we keep standard server access logs (IP address, user agent,
+        requested URL, timestamp) for security and rate limiting, rotated automatically. Your chosen venue and appetite
+        are stored only in your browser&apos;s local storage.
       </p>
 
       <h2>Signing in</h2>
       <p>
-        Sign-in is optional and uses Google, GitHub, or a one-time email link. We do not store passwords. When you sign
-        in we receive and store your <strong>email address</strong>, <strong>display name</strong>, and{" "}
-        <strong>profile image URL</strong> from the provider, plus the technical identifiers needed to recognise your
-        account on the next visit. We never receive your provider password and do not request access to your contacts,
-        repositories, or calendars.
+        Sign-in is optional: Google, GitHub, a one-time email link, or a local username and password. Local passwords
+        are stored as hashes in the desk database, not in plaintext. For OAuth we receive and store your{" "}
+        <strong>email address</strong>, <strong>display name</strong>, and <strong>profile image URL</strong> from the
+        provider, plus the technical identifiers needed to recognise your account on the next visit. We never receive
+        your provider password and do not request access to your contacts, repositories, or calendars.
       </p>
 
       <h2>Your workspace</h2>

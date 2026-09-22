@@ -30,6 +30,10 @@ frontend/.next/
 frontend/out/
 frontend/dist/
 npm-debug.log*
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/
+frontend/playwright/.cache/
 
 # OS / IDE
 .DS_Store

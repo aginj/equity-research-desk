@@ -24,6 +24,7 @@ from app.domain import (
     RiskAppetite,
     RunEvent,
     RunStage,
+    RunUsage,
     TickerIntel,
 )
 from app.ingest import DataHub
@@ -180,6 +181,7 @@ class DeskOrchestrator:
         tickers: list[str] | None = None,
         appetite: RiskAppetite | None = None,
         market_id: str | None = None,
+        trigger: str | None = None,
     ) -> AnalysisResult:
         async with self._lock:
             if self._active_run_id is not None:
@@ -196,6 +198,7 @@ class DeskOrchestrator:
                 stage="queued",
                 started_at=started,
                 market_id=market.id,
+                triggered_by=trigger,
             )
             with self.session_factory() as session:
                 session.add(
@@ -206,6 +209,7 @@ class DeskOrchestrator:
                         risk_appetite=risk,
                         market_id=market.id,
                         started_at=started,
+                        triggered_by=trigger,
                     )
                 )
                 session.commit()
@@ -252,6 +256,8 @@ class DeskOrchestrator:
     ) -> None:
         run_id = stub.run_id
         try:
+            self.llm.reset_usage()
+            self.hub.reset_usage()
             filings_label = market.filings_label
             await self._emit(
                 run_id,
@@ -305,7 +311,19 @@ class DeskOrchestrator:
             raw = [r.model_copy(deep=True) for r in recs]
             recs = apply_policy(recs, appetite, market)
 
-            summary = _summarize(scored, recs, appetite, self.settings, self.llm.enabled, market)
+            summary = _summarize(
+                scored,
+                recs,
+                appetite,
+                self.settings,
+                self.llm.enabled,
+                market,
+                usage=RunUsage(
+                    llm_calls=self.llm.calls,
+                    llm_tokens=self.llm.tokens,
+                    vendor_calls=self.hub.vendor_calls,
+                ),
+            )
             finished = datetime.now(UTC)
             result = AnalysisResult(
                 run_id=run_id,
@@ -314,12 +332,25 @@ class DeskOrchestrator:
                 started_at=stub.started_at,
                 finished_at=finished,
                 market_id=market.id,
+                triggered_by=stub.triggered_by,
                 summary=summary,
                 recommendations=recs,
                 intel=scored,
                 recommendations_raw=raw,
             )
             await asyncio.to_thread(self._persist, result)
+            try:
+                from app.snapshots import record_snapshots
+
+                await asyncio.to_thread(record_snapshots, result)
+            except Exception:  # pragma: no cover
+                logger.exception("Rating snapshot write failed", extra={"run_id": run_id})
+            try:
+                from app.notifications import notify_run_complete
+
+                await asyncio.to_thread(notify_run_complete, result)
+            except Exception:  # pragma: no cover
+                logger.exception("Run notifications failed", extra={"run_id": run_id})
             await self._emit(run_id, "completed", "Desk run complete.", 1.0)
             logger.info(
                 "Desk run completed",
@@ -356,6 +387,8 @@ class DeskOrchestrator:
             row.finished_at = result.finished_at
             row.error = result.error
             row.market_id = result.market_id
+            if result.triggered_by:
+                row.triggered_by = result.triggered_by
             row.payload_json = result.model_dump_json()
             session.add(row)
             session.commit()
@@ -388,6 +421,7 @@ def _failed(stub: AnalysisResult, market: MarketSpec, error: str) -> AnalysisRes
         started_at=stub.started_at,
         finished_at=datetime.now(UTC),
         market_id=market.id,
+        triggered_by=stub.triggered_by,
         error=error[:2000],
     )
 
@@ -395,7 +429,10 @@ def _failed(stub: AnalysisResult, market: MarketSpec, error: str) -> AnalysisRes
 def _row_to_result(row: AnalysisRunRow) -> AnalysisResult:
     if row.payload_json:
         try:
-            return AnalysisResult.model_validate_json(row.payload_json)
+            result = AnalysisResult.model_validate_json(row.payload_json)
+            if not result.triggered_by and row.triggered_by:
+                return result.model_copy(update={"triggered_by": row.triggered_by})
+            return result
         except ValueError:
             logger.warning("Corrupt run payload; returning metadata only", extra={"run_id": row.id})
     return AnalysisResult(
@@ -406,6 +443,7 @@ def _row_to_result(row: AnalysisRunRow) -> AnalysisResult:
         finished_at=row.finished_at,
         error=row.error,
         market_id=row.market_id or "us",
+        triggered_by=row.triggered_by,
     )
 
 
@@ -416,6 +454,7 @@ def _summarize(
     settings: Settings,
     llm_enabled: bool,
     market: MarketSpec,
+    usage: RunUsage | None = None,
 ) -> DeskSummary:
     acc = [r for r in recs if r.action == "accumulate"]
     reduce = [r for r in recs if r.action in {"reduce", "avoid"}]
@@ -477,4 +516,5 @@ def _summarize(
         exchange=market.exchange,
         currency=market.currency,
         caveats=caveats,
+        usage=usage or RunUsage(),
     )

@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from app.domain import Quote, Recommendation, Scorecard
-from app.markets import MARKETS, catalog_payload, get_market, normalize_ticker
+from app.markets import MARKETS, catalog_payload, get_market, normalize_ticker, presets_for
 from app.policy import apply_policy, clamp, composite_score
 
 
@@ -27,6 +27,13 @@ def test_catalog_pins_us_and_india():
 
 def test_normalize_ticker():
     assert normalize_ticker(" reliance.ns ") == "RELIANCE.NS"
+
+
+def test_index_presets_cover_core_venues():
+    us = presets_for("us")
+    assert any(row["id"] == "default" and "S&P" in str(row["label"]) for row in us)
+    assert presets_for("in-nse")[0]["label"] == "Nifty 50 core"
+    assert presets_for("uk-lse")[0]["label"] == "FTSE 100 core"
 
 
 def _rec(ticker: str, price: float) -> Recommendation:

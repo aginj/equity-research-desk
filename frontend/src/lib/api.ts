@@ -1,17 +1,25 @@
 import type {
   AnalysisResult,
+  AuditEntry,
   Book,
+  BookChanges,
   CoverageRequest,
+  DeskNotification,
+  DeskSchedule,
+  DeskUser,
   Health,
   Market,
   MarketCatalog,
   Me,
   Preferences,
+  RatingPoint,
   Recommendation,
   RiskAppetite,
   RunEvent,
   RunStatus,
   TickerIntel,
+  TrackRecord,
+  UniversePreset,
   UniverseTicker,
   WatchlistItem,
 } from "./types";
@@ -146,6 +154,26 @@ export const api = {
       body: JSON.stringify({ market_id }),
     }),
   coverageRequests: () => request<{ requests: CoverageRequest[] }>("/api/v1/admin/coverage-requests"),
+  schedule: () => request<DeskSchedule>("/api/v1/settings/schedule"),
+  setSchedule: (markets: DeskSchedule["markets"]) =>
+    request<DeskSchedule>("/api/v1/settings/schedule", {
+      method: "PUT",
+      body: JSON.stringify({
+        markets: markets.map((row) => ({
+          market_id: row.market_id,
+          morning: row.morning,
+          afternoon: row.afternoon,
+          enabled: row.enabled ?? true,
+          closed_dates: row.closed_dates ?? [],
+        })),
+      }),
+    }),
+
+  register: (username: string, password: string) =>
+    request<{ user: { id: string; role: string }; token: string; exp: number }>("/api/v1/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
 
   // --- the book (public) ------------------------------------------------------------------
   /** Latest completed run for a venue, re-ranked under `appetite` when given. */
@@ -171,6 +199,57 @@ export const api = {
   idea: (ticker: string, marketId?: string, appetite?: RiskAppetite | null) =>
     request<{ run_id: string; appetite: RiskAppetite; recommendation: Recommendation; intel: TickerIntel | null }>(
       `/api/v1/ideas/${encodeURIComponent(ticker)}${qs({ market_id: marketId, appetite })}`,
+    ),
+  ideaHistory: (ticker: string, marketId?: string) =>
+    request<{ ticker: string; market_id: string; points: RatingPoint[] }>(
+      `/api/v1/ideas/${encodeURIComponent(ticker)}/history${qs({ market_id: marketId })}`,
+    ),
+  bookChanges: async (marketId?: string, appetite?: RiskAppetite | null): Promise<BookChanges | null> => {
+    try {
+      return await request<BookChanges>(`/api/v1/book/changes${qs({ market_id: marketId, appetite })}`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
+  },
+  trackRecord: (marketId?: string) => request<TrackRecord>(`/api/v1/track-record${qs({ market_id: marketId })}`),
+  notifications: (unread = false) =>
+    request<{ unread: number; notifications: DeskNotification[] }>(
+      `/api/v1/me/notifications${qs({ unread: unread ? "true" : undefined })}`,
+    ),
+  markNotificationsRead: (ids?: string[]) =>
+    request<{ updated: number; unread: number }>("/api/v1/me/notifications/read", {
+      method: "POST",
+      body: JSON.stringify({ ids: ids ?? null }),
+    }),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ ok: boolean }>("/api/v1/me/password", {
+      method: "PUT",
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+  adminUsers: () => request<{ users: DeskUser[] }>("/api/v1/admin/users"),
+  setUserRole: (id: string, role: "user" | "admin") =>
+    request<{ id: string; role: string }>(`/api/v1/admin/users/${encodeURIComponent(id)}/role`, {
+      method: "PUT",
+      body: JSON.stringify({ role }),
+    }),
+  setUserDisabled: (id: string, disabled: boolean) =>
+    request<{ id: string; disabled: boolean }>(`/api/v1/admin/users/${encodeURIComponent(id)}/disabled`, {
+      method: "PUT",
+      body: JSON.stringify({ disabled }),
+    }),
+  resetUserPassword: (id: string, password: string) =>
+    request<{ ok: boolean }>(`/api/v1/admin/users/${encodeURIComponent(id)}/password`, {
+      method: "PUT",
+      body: JSON.stringify({ password }),
+    }),
+  audit: () => request<{ entries: AuditEntry[] }>("/api/v1/admin/audit"),
+  presets: (marketId: string) =>
+    request<{ market_id: string; presets: UniversePreset[] }>(`/api/v1/markets/${encodeURIComponent(marketId)}/presets`),
+  validateUniverse: (tickers: string[], marketId?: string) =>
+    request<{ verified: boolean; tickers: { ticker: string; status: string; price?: number | null }[] }>(
+      `/api/v1/admin/universe/validate${qs({ market_id: marketId })}`,
+      { method: "POST", body: JSON.stringify({ tickers }) },
     ),
 
   // --- personal workspace (requires sign-in) ----------------------------------------------
@@ -229,7 +308,7 @@ export async function waitForRun(
   while (!isTerminal(last.status)) {
     if (opts.signal?.aborted) break;
     if (Date.now() > deadline) {
-      throw new ApiError(0, `Run ${runId} is still ${last.status}; check the Runs page later.`, null, null);
+      throw new ApiError(0, `Run ${runId} is still ${last.status}; check Admin → Run history later.`, null, null);
     }
     await new Promise((resolve) => setTimeout(resolve, interval));
     last = await api.run(runId);

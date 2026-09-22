@@ -80,6 +80,13 @@ export const authConfig: NextAuthConfig = {
   session: { strategy: "jwt", maxAge: 30 * 24 * 60 * 60 },
   pages: { signIn: "/signin", error: "/signin" },
   trustHost: true,
+  // Auth.js requires a secret even for /api/auth/session and /providers. Local
+  // `npm run dev` has no frontend/.env.local — match docker-compose.yml's fallback.
+  // Production must set AUTH_SECRET (docker-compose.prod.yml refuses to start without it).
+  secret:
+    process.env.AUTH_SECRET ??
+    process.env.NEXTAUTH_SECRET ??
+    (process.env.NODE_ENV === "production" ? undefined : "dev-only-change-me-dev-only-change-me"),
   callbacks: {
     async jwt({ token, user }) {
       if (user) {
@@ -88,8 +95,18 @@ export const authConfig: NextAuthConfig = {
         token.email = user.email ?? token.email;
         token.name = user.name ?? token.name;
         token.picture = user.image ?? token.picture;
+        if (user.role) token.role = user.role;
+        if (user.apiToken) {
+          token.apiToken = user.apiToken;
+          token.apiTokenExp = user.apiTokenExp;
+        }
       }
-      token.role = roleFor(token.email);
+      const localAccount = String(token.sub ?? "").startsWith("local:");
+      if (!localAccount) {
+        token.role = roleFor(token.email);
+      } else if (!token.role) {
+        token.role = "user";
+      }
 
       const now = Math.floor(Date.now() / 1000);
       const needsToken =

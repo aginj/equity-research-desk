@@ -394,3 +394,54 @@ def catalog_payload() -> dict:
         return (pin, item["name"])
 
     return {"countries": sorted(countries.values(), key=sort_key)}
+
+
+INDEX_PRESETS: dict[str, list[dict[str, object]]] = {
+    "us": [
+        {
+            "id": "default",
+            "label": "S&P 100 core",
+            "tickers": list(MARKETS["us"].default_universe),
+        },
+        {
+            "id": "mega",
+            "label": "US mega-cap",
+            "tickers": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "TSLA"],
+        },
+    ],
+    "in-nse": [
+        {
+            "id": "default",
+            "label": "Nifty 50 core",
+            "tickers": list(MARKETS["in-nse"].default_universe),
+        }
+    ],
+    "in-bse": [
+        {
+            "id": "default",
+            "label": "Sensex core",
+            "tickers": list(MARKETS["in-bse"].default_universe),
+        }
+    ],
+    "uk-lse": [
+        {
+            "id": "default",
+            "label": "FTSE 100 core",
+            "tickers": list(MARKETS["uk-lse"].default_universe),
+        }
+    ],
+}
+
+
+def presets_for(market_id: str) -> list[dict[str, object]]:
+    spec = get_market(market_id)
+    items = INDEX_PRESETS.get(spec.id)
+    if items:
+        return items
+    return [
+        {
+            "id": "default",
+            "label": f"{spec.exchange_code} core",
+            "tickers": list(spec.default_universe),
+        }
+    ]

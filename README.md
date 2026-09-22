@@ -10,9 +10,10 @@ This is a research instrument. It is **not** a broker, not a registered adviser,
 - Licensed data adapters (Finnhub, NewsAPI, Alpha Vantage) plus **SEC EDGAR** (no publisher-site scraping)
 - Works with **zero API keys** via a complete demo book, then upgrades as keys are added
 - LLM synthesis when OpenAI, Anthropic, Cursor, or an OpenAI-compatible gateway is configured; otherwise transparent heuristics
-- Research-desk UI: ranked book, tape, idea pages with bull/bear/invalidation and citations — light/dark themes, live run pipeline, responsive layout
-- **Public website with optional sign-in**: anyone can read the book; signing in (Google, GitHub, or email link) unlocks a personal workspace — your venue, your risk appetite (the shared book is re-ranked for you, no extra cost), and a watchlist. Only admins can run the desk or edit the analyzed universe.
-- Audit trail of every run — SQLite locally, Postgres in production, schema managed by Alembic
+- Research-desk UI: ranked book with top ideas, filters, run-over-run changes, tape, idea pages with rating history and peers — light/dark themes, live run pipeline, responsive layout
+- **Public website with optional sign-in**: anyone can read the book; signing in (Google, GitHub, email link, or a local username/password) unlocks a personal workspace — your venue, your risk appetite (the shared book is re-ranked for you, no extra cost), a watchlist, and in-app notifications. Only admins can run the desk or edit the analyzed universe.
+- Weekday clock-time schedules: admins set two times per market (in that venue's timezone) on **Admin**, pause venues, and record closed dates. Overlapping jobs queue so only one desk run executes at a time. Run history is an Admin tab.
+- Audit trail of every run — SQLite locally, Postgres in production, schema managed by Alembic. Rating snapshots power history, track record, and watchlist alerts.
 
 ## Architecture
 
@@ -66,7 +67,7 @@ Desk: [http://localhost:3810](http://localhost:3810)
 
 Open the Desk page and click **Run desk**. With no keys, the book is built from bundled research fixtures. Add keys to `.env` and restart to blend live news, quotes, and filings.
 
-Locally, with no `SMP_AUTH_JWT_SECRET` or `SMP_API_KEY` set, admin actions are open and the API logs a warning at startup. To try sign-in locally, set `AUTH_SECRET`, `SMP_AUTH_JWT_SECRET` (same value in both `.env` and the frontend environment), `SMP_ADMIN_EMAILS`, and one OAuth provider (`AUTH_GITHUB_ID`/`AUTH_GITHUB_SECRET` with callback `http://localhost:3810/api/auth/callback/github` is the quickest). Email magic links additionally need Postgres (`DATABASE_URL`).
+Locally, with no `SMP_AUTH_JWT_SECRET`, `SMP_API_KEY`, or local accounts, admin actions are open and the API logs a warning at startup. To lock that down, open **Sign in** and create the first username/password account — it becomes admin. Later accounts are regular users. Passwords are stored hashed in the SQLite database, not in the browser. OAuth (`AUTH_GITHUB_*` / `AUTH_GOOGLE_*`) still works if you set it.
 
 ## Configuration
 
@@ -83,7 +84,8 @@ Copy `.env.example` to `.env` in the repo root. Setting names keep an `SMP_` pre
 | `SMP_SEC_USER_AGENT` | Required identity for EDGAR |
 | `SMP_FORCE_DEMO_DATA=true` | Fixtures only (demos / CI) |
 | `SMP_RISK_APPETITE` | `conservative` \| `balanced` \| `aggressive` |
-| `SMP_SCHEDULER_HOURS` | Optional unattended refresh |
+| `SMP_SCHEDULER_HOURS` | Interval fallback (hours) when no clock times are set in Admin. 0 disables |
+| `SMP_LLM_MAX_CALLS_PER_RUN` | Cap LLM completions per desk run (0 = unlimited). Excess names use heuristic synthesis |
 | `SMP_ENVIRONMENT` | `development` \| `staging` \| `production` (production rejects `SMP_CORS_ORIGINS=*` and requires auth) |
 | `SMP_DATABASE_URL` | `sqlite:///./data/desk.db` (dev) or `postgresql+psycopg://user:pass@host/db` (prod) |
 | `SMP_AUTH_JWT_SECRET` | Shared with the web app; the API verifies the bearer tokens Auth.js mints after sign-in (≥ 32 chars) |
@@ -112,7 +114,14 @@ npm run typecheck
 npm run build
 ```
 
-The same checks run in CI (`.github/workflows/ci.yml`) on Python 3.11 and 3.12, plus a Docker image build.
+The same checks run in CI (`.github/workflows/ci.yml`) on Python 3.11 and 3.12, plus a Docker image build and a Playwright job (`frontend/e2e`) that starts both servers with `SMP_FORCE_DEMO_DATA=true`.
+
+```powershell
+cd frontend
+npm run e2e
+```
+
+Playwright starts the API on port 8810 and the web app on 3810. The first local account created in those tests is admin.
 
 ## Docker
 
@@ -140,9 +149,9 @@ One origin, so there is no CORS and no API key in the browser. Auth.js owns iden
 
 | Who | Can |
 |---|---|
-| Anonymous | Read the book, tape, idea pages, run history for any venue. Rate-limited per IP. |
+| Anonymous | Read the book, tape, and idea pages for any venue. Rate-limited per IP. |
 | Signed in | Everything above, plus a personal workspace: preferred venue, risk appetite (the shared run is re-ranked with `apply_policy` from the chief analyst's raw output — no new agents or vendor calls), watchlist with coverage requests. |
-| Admin (`SMP_ADMIN_EMAILS`) | Trigger runs, edit the analyzed universe per venue, set desk defaults, see coverage requests. `X-API-Key` remains a machine credential for cron and scripts. |
+| Admin (`SMP_ADMIN_EMAILS` or first local account) | Trigger runs, edit the analyzed universe per venue (including index presets and symbol checks), set desk defaults, manage users, set weekday clock-time schedules (two times per market, pause and closed dates), and view run history plus usage. `X-API-Key` remains a machine credential for cron and scripts. |
 
 Users get a personal **watchlist**, not a personal analyzed universe, so run cost stays under admin control. Watchlisted tickers outside coverage surface on `/admin` as demand.
 
@@ -155,7 +164,7 @@ Users get a personal **watchlist**, not a personal analyzed universe, so run cos
    - GitHub: callback URL `https://DOMAIN/api/auth/callback/github`.
    - Email links: a [Resend](https://resend.com) API key and a verified sender in `AUTH_RESEND_FROM`.
 4. `./deploy/deploy.sh` — builds the images, runs `alembic upgrade head` against Postgres, starts Caddy/web/api/backup, and waits for health checks.
-5. Open `https://DOMAIN`, sign in with an admin email, go to **Admin**, set the universe, and press **Run desk now**. Set `SMP_SCHEDULER_HOURS` for unattended refreshes.
+5. Open `https://DOMAIN`, sign in as admin, go to **Admin**, set the universe, and press **Run desk now**. Set weekday clock times per market on that page (in each venue's timezone). The API process must stay running for those jobs. `SMP_SCHEDULER_HOURS` is only an interval fallback when no clock times are saved.
 
 Subsequent deploys are `git pull && ./deploy/deploy.sh` (or enable `.github/workflows/deploy.yml`, which SSHes in and runs the script after CI passes; it needs the `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, and `DEPLOY_PATH` secrets).
 
@@ -188,6 +197,36 @@ Default market: `SMP_DEFAULT_MARKET=us` (or `in-nse`, `in-bse`, `uk-lse`, …).
 - **News is lagged.** By the time a headline is public it is often in the price. The product is a briefing book, not an alpha engine.
 - **Heuristic fallback is first-class**, so the desk never depends on a model vendor to function.
 
+## API surface (desk extras)
+
+Public reads (optional `market_id` / `appetite`):
+
+- `GET /api/v1/book/changes` — run-over-run moves under the viewer appetite
+- `GET /api/v1/ideas/{ticker}/history` — rating snapshots for a name
+- `GET /api/v1/track-record` — forward mark-to-snapshot of past accumulate calls (research only)
+- `GET /api/v1/markets/{id}/presets` — curated index universes
+
+Signed-in:
+
+- `GET /api/v1/me/notifications`, `POST /api/v1/me/notifications/read`
+- `PUT /api/v1/me/password` — local accounts only
+
+Admin:
+
+- `GET /api/v1/admin/users`, `PUT .../role`, `PUT .../disabled`, `PUT .../password`
+- `GET /api/v1/admin/audit`
+- `POST /api/v1/admin/universe/validate` — Finnhub quote check when a key is set; otherwise `not_verified`
+
+Login lockout: five failed local sign-ins lock the account for 15 minutes.
+
+## Roadmap (not in this build)
+
+These stay documented rather than implemented:
+
+- Redis (or similar) as a shared run lock and rate-limit store for multi-worker API processes
+- Licensed NSE/BSE filing feeds (no scraping)
+- Live exchange holiday calendars (Admin closed dates are the in-repo substitute)
+
 ## Project layout
 
 ```
@@ -198,19 +237,22 @@ backend/app
   ratelimit.py       Per-IP / per-user rate limits as FastAPI dependencies
   config.py          Typed settings (pydantic-settings); fails fast on bad config
   observability.py   Logging setup, request-id middleware, access log
-  db.py              SQLModel tables (universe, runs, settings, users, preferences, watchlist)
+  db.py              SQLModel tables (universe, runs, settings, users, snapshots, notifications, audit)
   store.py           Engine, Alembic bootstrap, settings rows, workspace helpers
+  snapshots.py       Rating snapshots, book diffs, track record
+  notifications.py   Watchlist alerts, scheduled digest, failed-run notices
   ingest.py          Data hub with retrying HTTP helper and demo fallback
   policy.py          Deterministic desk policy
   agents/            Orchestrator (keeps raw recs for re-policy), LLM adapter, analysts, scoring
   data/              Bundled fixtures (US + international)
-backend/alembic      Migrations (0001 desk baseline, 0002 users + Auth.js tables)
+backend/alembic      Migrations (0001 desk baseline through 0006 users + audit)
 frontend/src
   auth.config.ts     Auth.js providers, JWT/session callbacks, API-token minting (edge-safe)
   auth.ts            Auth.js instance with the Postgres adapter
   middleware.ts      Redirects /workspace and /admin for anonymous / non-admin visitors
-  components/        WorkspaceProvider (venue, appetite, watchlist), UserMenu, DeskBoard, …
-  app/               Desk, research, runs, idea, workspace, admin, signin, privacy, terms
+  components/        WorkspaceProvider, DeskBoard, notifications, run history, …
+  app/               Desk, research, idea, workspace, admin, signin, privacy, terms
+frontend/e2e         Playwright flows (first admin, schedule save, demo run)
 deploy/              Caddyfile, .env.production.example, deploy.sh
 docker-compose.prod.yml  Caddy + web + api + Postgres + nightly backup
 ```

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { ActionPill } from "@/components/ActionPill";
 import {
@@ -19,11 +19,14 @@ import {
 import { RunProgress } from "@/components/RunProgress";
 import { ScoreBar } from "@/components/ScoreBar";
 import { Sparkline } from "@/components/Sparkline";
+import { TrackRecordCard } from "@/components/RatingTimeline";
+import { TopIdeas } from "@/components/TopIdeas";
+import { WhatChanged } from "@/components/WhatChanged";
 import { useWorkspace } from "@/components/WorkspaceProvider";
 import { Alert, Badge, Button, Card, CardHeader, EmptyState, Skeleton, Stat, cx } from "@/components/ui";
 import { api, isTerminal, subscribeRun, waitForRun } from "@/lib/api";
 import { compactCap, horizonLabel, ideaHref, money, pct, relativeTime } from "@/lib/format";
-import type { AnalysisResult, Book, Health, RunEvent } from "@/lib/types";
+import type { AnalysisResult, Book, BookChanges, Health, RunEvent, TrackRecord } from "@/lib/types";
 
 const STREAM_TIMEOUT_MS = 120_000;
 
@@ -36,6 +39,13 @@ export function DeskBoard() {
   const [busy, setBusy] = useState(false);
   const [live, setLive] = useState<RunEvent | null>(null);
   const [watchOnly, setWatchOnly] = useState(false);
+  const [query, setQuery] = useState("");
+  const [ratingFilter, setRatingFilter] = useState<string>("all");
+  const [sectorFilter, setSectorFilter] = useState<string>("all");
+  const [sortBy, setSortBy] = useState<"rank" | "conviction" | "name" | "change">("rank");
+  const [openNotes, setOpenNotes] = useState<string | null>(null);
+  const [changes, setChanges] = useState<BookChanges | null>(null);
+  const [record, setRecord] = useState<TrackRecord | null>(null);
   const { market, appetite, auth, isAdmin, watched, toggleWatch, loading: workspaceLoading } = useWorkspace();
   const mounted = useRef(true);
 
@@ -60,10 +70,17 @@ export function DeskBoard() {
   const refresh = useCallback(async () => {
     if (!marketId) return;
     try {
-      const [next, status] = await Promise.all([api.book(marketId, appetite), api.health()]);
+      const [next, status, delta, track] = await Promise.all([
+        api.book(marketId, appetite),
+        api.health(),
+        api.bookChanges(marketId, appetite).catch(() => null),
+        api.trackRecord(marketId).catch(() => null),
+      ]);
       if (!mounted.current) return;
       setBook(next);
       setHealth(status);
+      setChanges(delta);
+      setRecord(track);
       setError(null);
     } catch (err) {
       if (!mounted.current) return;
@@ -159,10 +176,30 @@ export function DeskBoard() {
   const allRecs = run?.recommendations ?? [];
   const signedIn = auth === "authenticated";
   const filterActive = signedIn && watchOnly && watched.size > 0;
-  const recs = useMemo(
-    () => (filterActive ? allRecs.filter((r) => watched.has(r.ticker)) : allRecs),
-    [allRecs, filterActive, watched],
+  const sectors = useMemo(
+    () => Array.from(new Set(allRecs.map((row) => row.sector).filter(Boolean))).sort(),
+    [allRecs],
   );
+  const recs = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    let rows = filterActive ? allRecs.filter((row) => watched.has(row.ticker)) : allRecs;
+    if (ratingFilter !== "all") rows = rows.filter((row) => row.action === ratingFilter);
+    if (sectorFilter !== "all") rows = rows.filter((row) => row.sector === sectorFilter);
+    if (needle) {
+      rows = rows.filter(
+        (row) =>
+          row.ticker.toLowerCase().includes(needle) ||
+          row.name.toLowerCase().includes(needle) ||
+          row.sector.toLowerCase().includes(needle),
+      );
+    }
+    const sorted = [...rows];
+    if (sortBy === "conviction") sorted.sort((a, b) => b.conviction - a.conviction);
+    else if (sortBy === "name") sorted.sort((a, b) => a.ticker.localeCompare(b.ticker));
+    else if (sortBy === "change") sorted.sort((a, b) => b.quote.change_pct - a.quote.change_pct);
+    return sorted;
+  }, [allRecs, filterActive, watched, ratingFilter, sectorFilter, query, sortBy]);
+  const filtersOn = ratingFilter !== "all" || sectorFilter !== "all" || query.trim().length > 0;
   const accumulate = useMemo(() => allRecs.filter((r) => r.action === "accumulate"), [allRecs]);
   const leaders = useMemo(() => allRecs.slice(0, 3), [allRecs]);
   const intelByTicker = useMemo(() => new Map((run?.intel ?? []).map((i) => [i.ticker, i])), [run]);
@@ -208,7 +245,7 @@ export function DeskBoard() {
         </div>
         <div className="flex flex-col items-start gap-3 lg:items-end">
           {isAdmin ? (
-            <Button size="lg" onClick={() => void runDesk()} loading={busy} disabled={busy}>
+            <Button size="lg" onClick={() => void runDesk()} loading={busy} disabled={busy} data-testid="run-desk">
               {!busy ? <IconPlay size={14} /> : null}
               {busy ? "Running desk…" : "Run desk"}
             </Button>
@@ -216,7 +253,7 @@ export function DeskBoard() {
             <Badge tone="accent" dot pulse className="h-9 px-3 text-xs">
               Desk run in progress
             </Badge>
-          ) : signedIn ? (
+          ) : signedIn || health?.auth === false ? (
             <Link
               href="/workspace"
               className="inline-flex h-11 items-center gap-2 rounded-xl border border-border-strong bg-surface px-5 text-sm font-medium text-fg transition hover:bg-surface-hover"
@@ -291,6 +328,13 @@ export function DeskBoard() {
         />
       </section>
 
+      {run ? <TopIdeas rows={accumulate.slice(0, 6)} /> : null}
+
+      <div className="grid gap-4 lg:grid-cols-[1.4fr_0.6fr]">
+        <WhatChanged changes={changes} />
+        <TrackRecordCard record={record} />
+      </div>
+
       {/* Ranked book */}
       <Card className="fade-up overflow-hidden">
         <CardHeader
@@ -302,21 +346,6 @@ export function DeskBoard() {
           }
           action={
             <div className="flex items-center gap-3">
-              {signedIn && watched.size > 0 ? (
-                <button
-                  onClick={() => setWatchOnly((v) => !v)}
-                  aria-pressed={watchOnly}
-                  className={cx(
-                    "inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium transition",
-                    watchOnly
-                      ? "border-transparent bg-accent-soft text-accent"
-                      : "border-border bg-surface text-fg-2 hover:bg-surface-hover",
-                  )}
-                >
-                  {watchOnly ? <IconStarFilled size={12} /> : <IconStar size={12} />}
-                  Watchlist only
-                </button>
-              ) : null}
               {run ? (
                 <Link href="/research" className="inline-flex items-center gap-1 text-xs font-medium text-accent hover:underline underline-offset-4">
                   Open tape <IconArrowUpRight size={14} />
@@ -325,6 +354,52 @@ export function DeskBoard() {
             </div>
           }
         />
+        {allRecs.length > 0 ? (
+          <div className="flex flex-col gap-3 border-b border-border px-5 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search ticker, name, sector"
+                aria-label="Search the book"
+                className="h-8 w-full max-w-xs rounded-lg border border-border-strong bg-surface px-3 text-xs text-fg placeholder:text-muted-2 focus:border-accent md:w-56"
+              />
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+                aria-label="Sort the book"
+                className="h-8 rounded-lg border border-border-strong bg-surface px-2 text-xs text-fg"
+              >
+                <option value="rank">Sort · rank</option>
+                <option value="conviction">Sort · conviction</option>
+                <option value="change">Sort · 30d</option>
+                <option value="name">Sort · name</option>
+              </select>
+              {signedIn && watched.size > 0 ? (
+                <Chip active={watchOnly} onClick={() => setWatchOnly((v) => !v)}>
+                  {watchOnly ? <IconStarFilled size={12} /> : <IconStar size={12} />}
+                  Watchlist only
+                </Chip>
+              ) : null}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(["all", "accumulate", "watch", "reduce", "avoid"] as const).map((rating) => (
+                <Chip key={rating} active={ratingFilter === rating} onClick={() => setRatingFilter(rating)}>
+                  {rating === "all" ? "All ratings" : rating}
+                </Chip>
+              ))}
+              {sectors.map((sector) => (
+                <Chip
+                  key={sector}
+                  active={sectorFilter === sector}
+                  onClick={() => setSectorFilter((current) => (current === sector ? "all" : sector))}
+                >
+                  {sector}
+                </Chip>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <div className="overflow-x-auto">
           {isLoading ? (
             <TableSkeleton />
@@ -349,87 +424,177 @@ export function DeskBoard() {
           ) : recs.length === 0 ? (
             <EmptyState
               icon={<IconStar size={22} />}
-              title="None of your watchlist is in this book"
-              description="Starred names that are not in the analyzed universe show up as coverage requests for the desk admins."
+              title={filtersOn ? "No names match these filters" : "None of your watchlist is in this book"}
+              description={
+                filtersOn
+                  ? "Clear search, rating, or sector chips to see the rest of the book."
+                  : "Starred names that are not in the analyzed universe show up as coverage requests for the desk admins."
+              }
               action={
-                <Button variant="secondary" onClick={() => setWatchOnly(false)}>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setWatchOnly(false);
+                    setQuery("");
+                    setRatingFilter("all");
+                    setSectorFilter("all");
+                  }}
+                >
                   Show the whole book
                 </Button>
               }
             />
           ) : (
-            <table className="min-w-full text-left text-sm">
-              <thead>
-                <tr className="border-b border-border text-[11px] uppercase tracking-wider text-muted">
-                  {signedIn ? <th className="w-10 px-3 py-3" aria-label="Watch" /> : null}
-                  <th className="px-5 py-3 font-medium">Name</th>
-                  <th className="px-3 py-3 font-medium">Rating</th>
-                  <th className="px-3 py-3 font-medium">Last</th>
-                  <th className="px-3 py-3 font-medium">30d</th>
-                  <th className="px-3 py-3 font-medium">Conviction</th>
-                  <th className="px-3 py-3 font-medium">Horizon</th>
-                  <th className="px-5 py-3 font-medium">Thesis</th>
-                </tr>
-              </thead>
-              <tbody>
+            <>
+              <ul className="divide-y divide-border md:hidden">
                 {recs.map((row, index) => {
                   const intel = intelByTicker.get(row.ticker);
                   const up = row.quote.change_pct >= 0;
                   const starred = watched.has(row.ticker);
+                  const notesOpen = openNotes === row.ticker;
                   return (
-                    <tr key={row.ticker} className="row-hover border-b border-border last:border-0">
-                      {signedIn ? (
-                        <td className="px-3 py-3.5">
+                    <li key={row.ticker} className="px-4 py-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <Link href={ideaHref(row.ticker)} className="min-w-0">
+                          <span className="mono text-[11px] text-muted">{index + 1}</span>
+                          <span className="mono ml-2 text-sm font-semibold text-fg">{row.ticker}</span>
+                          <div className="truncate text-xs text-muted">{row.name}</div>
+                        </Link>
+                        <ActionPill action={row.action} />
+                      </div>
+                      <div className="mt-2 flex items-center justify-between gap-3 text-xs">
+                        <span className="mono tabular font-medium">{money(row.quote.price, row.quote.currency)}</span>
+                        <span className={cx("mono tabular", up ? "text-success" : "text-danger")}>{pct(row.quote.change_pct)}</span>
+                        <span className="text-muted">{horizonLabel(row.horizon)}</span>
+                      </div>
+                      <p className="mt-2 line-clamp-2 text-[13px] leading-relaxed text-fg-2">{row.thesis}</p>
+                      <div className="mt-2 flex items-center justify-between">
+                        <Sparkline values={intel?.candle?.closes ?? []} />
+                        {signedIn ? (
                           <button
+                            type="button"
                             onClick={() => void toggleWatch(row.ticker)}
                             aria-pressed={starred}
                             aria-label={starred ? `Remove ${row.ticker} from watchlist` : `Add ${row.ticker} to watchlist`}
-                            className={cx(
-                              "flex h-7 w-7 items-center justify-center rounded-lg transition",
-                              starred ? "text-warning hover:bg-warning-soft" : "text-muted-2 hover:bg-surface-2 hover:text-fg-2",
-                            )}
+                            className={cx("flex h-8 w-8 items-center justify-center rounded-lg", starred ? "text-warning" : "text-muted")}
                           >
                             {starred ? <IconStarFilled size={15} /> : <IconStar size={15} />}
                           </button>
-                        </td>
+                        ) : null}
+                      </div>
+                      {row.policy_notes.length ? (
+                        <button
+                          type="button"
+                          className="mt-2 text-[11px] text-accent"
+                          aria-expanded={notesOpen}
+                          onClick={() => setOpenNotes(notesOpen ? null : row.ticker)}
+                        >
+                          {notesOpen ? "Hide policy notes" : `${row.policy_notes.length} policy note${row.policy_notes.length === 1 ? "" : "s"}`}
+                        </button>
                       ) : null}
-                      <td className="px-5 py-3.5">
-                        <Link href={ideaHref(row.ticker)} className="group flex items-center gap-3">
-                          <span className="mono tabular flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-surface-2 text-[11px] text-muted">
-                            {index + 1}
-                          </span>
-                          <span className="min-w-0">
-                            <span className="mono block text-[13px] font-semibold text-fg group-hover:text-accent">
-                              {row.ticker}
-                            </span>
-                            <span className="block truncate text-xs text-muted">{row.name}</span>
-                            <span className="block truncate text-[11px] text-muted-2">{row.sector}</span>
-                          </span>
-                        </Link>
-                      </td>
-                      <td className="px-3 py-3.5">
-                        <ActionPill action={row.action} />
-                      </td>
-                      <td className="px-3 py-3.5">
-                        <div className="mono tabular text-[13px] font-medium text-fg">{money(row.quote.price, row.quote.currency)}</div>
-                        <div className={cx("mono tabular text-xs", up ? "text-success" : "text-danger")}>{pct(row.quote.change_pct)}</div>
-                        <div className="text-[11px] text-muted-2">{compactCap(row.quote.market_cap, row.quote.currency)}</div>
-                      </td>
-                      <td className="px-3 py-3.5">
-                        <Sparkline values={intel?.candle?.closes ?? []} />
-                      </td>
-                      <td className="px-3 py-3.5">
-                        <Conviction value={row.conviction} />
-                      </td>
-                      <td className="px-3 py-3.5 text-xs text-muted">{horizonLabel(row.horizon)}</td>
-                      <td className="max-w-md px-5 py-3.5 text-[13px] leading-relaxed text-fg-2">
-                        <span className="line-clamp-2">{row.thesis}</span>
-                      </td>
-                    </tr>
+                      {notesOpen ? (
+                        <ul className="mt-1 space-y-1 text-[11px] text-muted">
+                          {row.policy_notes.map((note) => (
+                            <li key={note}>— {note}</li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </li>
                   );
                 })}
-              </tbody>
-            </table>
+              </ul>
+              <table className="hidden min-w-full text-left text-sm md:table">
+                <thead>
+                  <tr className="border-b border-border text-[11px] uppercase tracking-wider text-muted">
+                    {signedIn ? <th className="w-10 px-3 py-3" aria-label="Watch" /> : null}
+                    <th className="px-5 py-3 font-medium">Name</th>
+                    <th className="px-3 py-3 font-medium">Rating</th>
+                    <th className="px-3 py-3 font-medium">Last</th>
+                    <th className="px-3 py-3 font-medium">30d</th>
+                    <th className="px-3 py-3 font-medium">Conviction</th>
+                    <th className="px-3 py-3 font-medium">Horizon</th>
+                    <th className="px-5 py-3 font-medium">Thesis</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recs.map((row, index) => {
+                    const intel = intelByTicker.get(row.ticker);
+                    const up = row.quote.change_pct >= 0;
+                    const starred = watched.has(row.ticker);
+                    const notesOpen = openNotes === row.ticker;
+                    return (
+                      <tr key={row.ticker} className="row-hover border-b border-border last:border-0">
+                        {signedIn ? (
+                          <td className="px-3 py-3.5">
+                            <button
+                              type="button"
+                              onClick={() => void toggleWatch(row.ticker)}
+                              aria-pressed={starred}
+                              aria-label={starred ? `Remove ${row.ticker} from watchlist` : `Add ${row.ticker} to watchlist`}
+                              className={cx(
+                                "flex h-7 w-7 items-center justify-center rounded-lg transition",
+                                starred ? "text-warning hover:bg-warning-soft" : "text-muted-2 hover:bg-surface-2 hover:text-fg-2",
+                              )}
+                            >
+                              {starred ? <IconStarFilled size={15} /> : <IconStar size={15} />}
+                            </button>
+                          </td>
+                        ) : null}
+                        <td className="px-5 py-3.5">
+                          <Link href={ideaHref(row.ticker)} className="group flex items-center gap-3">
+                            <span className="mono tabular flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-surface-2 text-[11px] text-muted">
+                              {index + 1}
+                            </span>
+                            <span className="min-w-0">
+                              <span className="mono block text-[13px] font-semibold text-fg group-hover:text-accent">
+                                {row.ticker}
+                              </span>
+                              <span className="block truncate text-xs text-muted">{row.name}</span>
+                              <span className="block truncate text-[11px] text-muted-2">{row.sector}</span>
+                            </span>
+                          </Link>
+                        </td>
+                        <td className="px-3 py-3.5">
+                          <ActionPill action={row.action} />
+                        </td>
+                        <td className="px-3 py-3.5">
+                          <div className="mono tabular text-[13px] font-medium text-fg">{money(row.quote.price, row.quote.currency)}</div>
+                          <div className={cx("mono tabular text-xs", up ? "text-success" : "text-danger")}>{pct(row.quote.change_pct)}</div>
+                          <div className="text-[11px] text-muted-2">{compactCap(row.quote.market_cap, row.quote.currency)}</div>
+                        </td>
+                        <td className="px-3 py-3.5">
+                          <Sparkline values={intel?.candle?.closes ?? []} />
+                        </td>
+                        <td className="px-3 py-3.5">
+                          <Conviction value={row.conviction} />
+                        </td>
+                        <td className="px-3 py-3.5 text-xs text-muted">{horizonLabel(row.horizon)}</td>
+                        <td className="max-w-md px-5 py-3.5 text-[13px] leading-relaxed text-fg-2">
+                          <span className="line-clamp-2">{row.thesis}</span>
+                          {row.policy_notes.length ? (
+                            <button
+                              type="button"
+                              className="mt-1 block text-[11px] text-accent hover:underline"
+                              aria-expanded={notesOpen}
+                              onClick={() => setOpenNotes(notesOpen ? null : row.ticker)}
+                            >
+                              {notesOpen ? "Hide policy notes" : `${row.policy_notes.length} policy note${row.policy_notes.length === 1 ? "" : "s"}`}
+                            </button>
+                          ) : null}
+                          {notesOpen ? (
+                            <ul className="mt-1 space-y-0.5 text-[11px] text-muted">
+                              {row.policy_notes.map((note) => (
+                                <li key={note}>— {note}</li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
           )}
         </div>
       </Card>
@@ -523,5 +688,31 @@ function TableSkeleton() {
         </div>
       ))}
     </div>
+  );
+}
+
+function Chip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cx(
+        "inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium capitalize transition",
+        active
+          ? "border-transparent bg-accent-soft text-accent"
+          : "border-border bg-surface text-fg-2 hover:bg-surface-hover",
+      )}
+    >
+      {children}
+    </button>
   );
 }

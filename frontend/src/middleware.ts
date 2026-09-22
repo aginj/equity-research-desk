@@ -9,10 +9,13 @@ const { auth } = NextAuth(authConfig);
 export default auth((request) => {
   const { pathname, search } = request.nextUrl;
   const session = request.auth;
-  // Mirror the API: with no JWT secret configured, desk admin is open locally.
+  // Mirror the API: with no JWT secret configured, admin and workspace are open locally.
   const authConfigured = Boolean(process.env.SMP_AUTH_JWT_SECRET);
 
-  if (pathname.startsWith("/workspace") && !session?.user) {
+  if (pathname.startsWith("/workspace")) {
+    if (!authConfigured || session?.user) {
+      return NextResponse.next();
+    }
     const url = new URL("/signin", request.url);
     url.searchParams.set("callbackUrl", pathname + search);
     return NextResponse.redirect(url);

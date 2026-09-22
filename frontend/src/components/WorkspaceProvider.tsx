@@ -27,6 +27,11 @@ type WorkspaceValue = {
   user: UserProfile | null;
   role: Role | "anonymous";
   isAdmin: boolean;
+  /**
+   * Whether the API requires sign-in (`null` until `/health` answers).
+   * When `false`, workspace/admin are open locally without an account.
+   */
+  authEnabled: boolean | null;
   catalog: MarketCatalog | null;
   market: Market | null;
   /** `null` = view under the appetite the run was produced with. */
@@ -46,6 +51,7 @@ const WorkspaceContext = createContext<WorkspaceValue>({
   user: null,
   role: "anonymous",
   isAdmin: false,
+  authEnabled: null,
   catalog: null,
   market: null,
   appetite: null,
@@ -94,8 +100,8 @@ function findMarket(catalog: MarketCatalog | null, id: string | null): Market | 
 export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
   const { data: session, status } = useSession();
   const auth: AuthState = status === "loading" ? "loading" : session?.user ? "authenticated" : "anonymous";
-  // When the API reports auth=false, local admin actions are open (no sign-in needed).
-  const [openAdmin, setOpenAdmin] = useState(false);
+  // When the API reports auth=false, local admin/workspace are open (no sign-in needed).
+  const [authEnabled, setAuthEnabled] = useState<boolean | null>(null);
 
   // Push the bearer token into the API client synchronously with session changes.
   setApiToken(session?.apiToken ?? null);
@@ -105,10 +111,11 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
     api
       .health()
       .then((health) => {
-        if (!cancelled) setOpenAdmin(health.auth === false);
+        if (!cancelled) setAuthEnabled(health.auth ?? false);
       })
       .catch(() => {
-        if (!cancelled) setOpenAdmin(false);
+        // Fail closed for page gates: treat auth as required if health is unreachable.
+        if (!cancelled) setAuthEnabled(true);
       });
     return () => {
       cancelled = true;
@@ -265,20 +272,21 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
       auth,
       user: me?.user ?? (session?.user ? { id: session.user.id, email: session.user.email, name: session.user.name, image: session.user.image, role: session.user.role } : null),
       role: me?.user.role ?? session?.user?.role ?? "anonymous",
-      isAdmin: (me?.user.role ?? session?.user?.role) === "admin" || openAdmin,
+      isAdmin: (me?.user.role ?? session?.user?.role) === "admin" || authEnabled === false,
+      authEnabled,
       catalog,
       market,
       appetite,
       watchlist,
       watched,
-      loading: loading || auth === "loading" || (!catalog && !error),
+      loading: loading || auth === "loading" || authEnabled === null || (!catalog && !error),
       error,
       setMarketId,
       setAppetite,
       toggleWatch,
       refreshWorkspace,
     }),
-    [auth, me, session, openAdmin, catalog, market, appetite, watchlist, watched, loading, error, setMarketId, setAppetite, toggleWatch, refreshWorkspace],
+    [auth, me, session, authEnabled, catalog, market, appetite, watchlist, watched, loading, error, setMarketId, setAppetite, toggleWatch, refreshWorkspace],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

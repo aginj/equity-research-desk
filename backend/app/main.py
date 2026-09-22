@@ -12,10 +12,12 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import __version__
-from app.agents.orchestrator import DeskOrchestrator, RunInProgressError
+from app.agents.orchestrator import DeskOrchestrator
 from app.api import router
+from app.auth import auth_enforced
 from app.config import get_settings
 from app.observability import RequestContextMiddleware, configure_logging, get_request_id
+from app.scheduler import DeskScheduler
 from app.store import init_db, recover_stale_runs, session_factory
 
 logger = logging.getLogger("desk")
@@ -28,36 +30,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     recover_stale_runs()
     orchestrator = DeskOrchestrator(session_factory, settings)
     app.state.orchestrator = orchestrator
+    desk_scheduler = DeskScheduler(orchestrator, interval_hours=settings.scheduler_hours)
+    desk_scheduler.start()
+    app.state.desk_scheduler = desk_scheduler
 
-    scheduler = None
-    if settings.scheduler_hours > 0:
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-        async def scheduled_refresh() -> None:
-            try:
-                await orchestrator.start()
-            except RunInProgressError as exc:
-                logger.info("Scheduled refresh skipped; run %s still active", exc.run_id)
-            except Exception:
-                logger.exception("Scheduled refresh failed to start")
-
-        scheduler = AsyncIOScheduler()
-        scheduler.add_job(
-            scheduled_refresh,
-            "interval",
-            hours=settings.scheduler_hours,
-            id="desk-refresh",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-        scheduler.start()
-        logger.info("Scheduler enabled every %s hour(s)", settings.scheduler_hours)
-
-    if not settings.auth_enabled and not settings.requires_api_key:
+    if not auth_enforced(settings):
         logger.warning(
-            "No SMP_AUTH_JWT_SECRET or SMP_API_KEY configured: admin endpoints are OPEN. "
-            "Fine for local development; never expose this instance to the internet."
+            "No SMP_AUTH_JWT_SECRET, SMP_API_KEY, or local accounts: admin endpoints are OPEN. "
+            "Create an account at /signin (first user is admin) before exposing this instance."
         )
     logger.info(
         "%s %s ready - env=%s llm=%s live_market=%s demo=%s auth=%s api_key=%s admins=%d",
@@ -67,15 +47,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.has_llm,
         settings.has_live_market,
         settings.force_demo_data,
-        settings.auth_enabled,
+        auth_enforced(settings),
         settings.requires_api_key,
         len(settings.admin_email_set),
     )
     try:
         yield
     finally:
-        if scheduler:
-            scheduler.shutdown(wait=False)
+        if desk_scheduler:
+            desk_scheduler.shutdown()
         await orchestrator.shutdown()
         logger.info("%s stopped", settings.app_name)
 

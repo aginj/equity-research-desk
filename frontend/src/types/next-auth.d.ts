@@ -3,6 +3,11 @@ import type { DefaultSession } from "next-auth";
 import type { Role } from "@/auth.config";
 
 declare module "next-auth" {
+  interface User {
+    role?: Role;
+    apiToken?: string;
+    apiTokenExp?: number;
+  }
   interface Session {
     /** Short-lived HS256 token for the research API (`Authorization: Bearer`). */
     apiToken?: string;

@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
@@ -5,6 +6,11 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   // Emits a self-contained server bundle for the Docker runtime stage.
   output: "standalone",
+  // A stray lockfile in the repo root made Turbopack treat the parent folder as
+  // the app root, which breaks next/font/google ("queries have exactly one entry").
+  turbopack: {
+    root: path.join(__dirname),
+  },
   async headers() {
     return [
       {
